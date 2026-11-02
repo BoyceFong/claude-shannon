@@ -60,8 +60,20 @@ Every other `claude` usage passes through untouched.
 - **In-place switching** — clicking a row respawns the right pane's Claude host on that conversation. Works across projects, not just the current one.
 - **Fleet view as home screen** — the right pane starts on Claude Code's own fleet view; everything you can do there, you can do here.
 - **Collapse to a rail** — `M-s` or the `◀ 收起` button shrinks the sidebar to a 2-column rail with a `▶` expand button at the bottom. Nothing is ever destroyed.
-- **Quit from the sidebar** — `✕ 退出` in the footer closes the whole workspace.
-- **Pinned widths** — while you resize the window, an enforcer hook re-pins the sidebar to your width on every change; only the right pane flexes.
+- **Quit from the sidebar** — `✕ 退出` in the footer, or `M-q`, closes the whole workspace.
+- **Pinned widths, no flicker** — the sidebar is a tmux `main-vertical` main pane: its width is held by tmux itself while you resize the window; only the right pane flexes. Crossing `COLLAPSE_AT` switches between expanded and rail.
+
+## Keybindings
+
+| Key | Action |
+| --- | --- |
+| `M-s` (Alt+S) | Collapse / expand the sidebar |
+| `M-q` (Alt+Q) | Quit the workspace |
+| `↑` `↓` / `j` `k` | Move the selection (gray highlight) |
+| `Enter` | Open the selected session in the right pane |
+| Mouse | Click rows, `◀` `▶` `✕` buttons; drag the divider to resize |
+
+> macOS `⌘` chords never reach the terminal (the GUI intercepts them), so `⌘X` cannot be bound inside tmux. If you want a Cmd-style quit, map `⌘Q` → "send Alt+Q" in your terminal's keyboard settings.
 - **Auto-fit** — below `COLLAPSE_AT` columns the sidebar auto-collapses so Claude keeps a usable width; it restores itself when the window grows.
 - **Width memory** — drag the divider to whatever width you like; it sticks across collapse/expand cycles.
 - **Stable ordering** — loading a conversation never shuffles the list; order is frozen when the workspace opens.

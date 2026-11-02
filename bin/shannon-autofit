@@ -1,10 +1,10 @@
 #!/bin/sh
-# shannon-autofit — tmux client-resized 钩子,布局强制器:
-#   窗口宽 < COLLAPSE_AT      → 侧栏钉在 RAIL_W(rail)
-#   窗口宽 >= COLLAPSE_AT     → 侧栏钉在 EXPAND_W(记忆宽度)
-# tmux 在窗口变化时按比例重排各面板,本脚本随后把侧栏纠正回目标宽度,
-# 拖动过程中侧栏宽度因此保持恒定,变的只有右栏。
-# mode=manual(用户手动折叠)时,拓宽窗口也不会自动展开。
+# shannon-autofit — tmux client-resized 钩子, 阈值守门:
+#   窗口宽 < COLLAPSE_AT   → main-pane-width = RAIL_W (rail)
+#   窗口宽 >= COLLAPSE_AT  → main-pane-width = EXPAND_W (记忆宽度)
+# 平时的窗口拖动不需要本脚本动手: main-vertical 布局下 tmux 自己保持
+# 侧栏宽度恒定, 只有跨过阈值时才切换 main-pane-width。
+# mode=manual(用户手动折叠)时, 拓宽窗口也不会自动展开。
 
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 STATE_DIR="$HOME/.claude/shannon"
@@ -15,7 +15,7 @@ RAIL_W=${RAIL_W:-2}
 COLLAPSE_AT=${COLLAPSE_AT:-70}
 
 # 展开宽度 = 用户记忆值, 限制在 [12, 35]
-EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null)
+EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
 case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
 [ "$EXPAND_W" -ge 12 ] 2>/dev/null || EXPAND_W=$SIDEBAR_W
 [ "$EXPAND_W" -le 35 ] 2>/dev/null || EXPAND_W=35
@@ -31,6 +31,16 @@ W=$(tmux display-message -p -t "$SESS:0" '#{window_width}' 2>/dev/null)
 
 pane_w() { tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null; }
 
+apply() { # $1 = 目标宽度, $2 = mode
+  tmux set-window-option -t "$SESS:0" main-pane-width "$1" 2>/dev/null
+  tmux select-layout -t "$SESS:0" main-vertical 2>/dev/null
+  CW2=$(pane_w)
+  if [ "$CW2" != "$1" ]; then
+    tmux resize-pane -t "$SB" -x "$1" 2>/dev/null
+  fi
+  echo "$2" > "$STATE_DIR/mode"
+}
+
 # 侧栏面板不存在: 宽度足够且非手动折叠 → 重新切出
 if [ -z "$SB" ]; then
   if [ "$W" -ge "$COLLAPSE_AT" ] && [ "$MODE" != "manual" ]; then
@@ -44,16 +54,12 @@ CW=$(pane_w)
 [ -n "$CW" ] || exit 0
 
 if [ "$W" -lt "$COLLAPSE_AT" ]; then
-  # 窄窗口: 钉在 rail
-  case "$CW" in [1-9]) ;; *) tmux resize-pane -t "$SB" -x "$RAIL_W" ;; esac
-  echo auto-collapsed > "$STATE_DIR/mode"
+  case "$CW" in [1-9]) exit 0 ;; esac   # 已是 rail
+  apply "$RAIL_W" auto-collapsed
 else
-  # 宽窗口: 手动折叠的尊重用户; 其余钉在记忆宽度
   if [ "$MODE" = "manual" ]; then
-    case "$CW" in [1-9]) exit 0 ;; esac
+    case "$CW" in [1-9]) exit 0 ;; esac   # 用户手动折叠, 尊重
   fi
-  if [ "$CW" != "$EXPAND_W" ]; then
-    tmux resize-pane -t "$SB" -x "$EXPAND_W"
-  fi
-  echo auto > "$STATE_DIR/mode"
+  [ "$CW" = "$EXPAND_W" ] && exit 0       # 已是目标宽度
+  apply "$EXPAND_W" auto
 fi

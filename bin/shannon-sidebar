@@ -244,23 +244,29 @@ def live_status() -> dict:
 
 
 def status_glyph(sid: str, live: dict) -> tuple:
-    """(字符, 色对) — 行尾状态圆点"""
+    """(字符, 状态种类) — 行尾状态圆点; 色对由绘制层按焦点状态决定"""
     st = live.get(sid)
     if st is None:
-        return ("○", 3)                      # 历史(未运行)
+        return ("○", "idle")                 # 历史(未运行)
     s = st.lower()
     if sid == current_session_id():
-        return ("●", 5)                      # 右栏当前会话
+        return ("●", "accent")               # 右栏当前会话
     if "input" in s or "wait" in s:
-        return ("●", 9)                      # 等待输入
+        return ("●", "yellow")               # 等待输入
     if s in ("busy", "working", "active", "running"):
-        return ("●", 5)                      # 工作中
+        return ("●", "accent")               # 工作中
     if s in ("done", "completed"):
-        return ("●", 8)                      # 完成
+        return ("●", "green")                # 完成
     if "fail" in s or "error" in s:
-        return ("●", 10)                     # 失败
-    return ("●", 3)                          # 已停止/退出
-    # 右栏当前会话已在其上判定为珊瑚色
+        return ("●", "red")                  # 失败
+    return ("●", "dim")                      # 已停止/退出
+
+
+KIND_PAIR = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
+             "dim": 3, "idle": 3}
+# 焦点行(灰底)使用的同色系变体(前景不变, 底色 236)
+CURSOR_BG = {"accent": 15, "green": 16, "yellow": 17, "red": 18,
+             "dim": 14, "idle": 14}
 
 
 # ---------------------------------------------------------------- 操作
@@ -441,26 +447,28 @@ class App:
                                curses.color_pair(2) | curses.A_BOLD)
             else:
                 row = payload
-                selected = (self.sel < len(row_idx)
-                            and row_idx[self.sel] == i)
+                cursor = (self.sel < len(row_idx)
+                          and row_idx[self.sel] == i)
                 current = row["id"] == current_session_id()
                 t = ago(row["mtime"], now_ms)
-                gch, gpair = status_glyph(row["id"], live)
-                marker = "▌" if selected else " "
+                gch, kind = status_glyph(row["id"], live)
                 room = max(6, W - cell_len(t) - 6)
                 title = trunc(row["title"], room)
-                pad = " " * max(1, room - cell_len(title) + 1)
-                if selected or current:
-                    a_title = curses.color_pair(5)   # 选中/当前 → 珊瑚色
+                if cursor:
+                    # 键盘/点击焦点: 整行灰底带(珊瑚色只属于当前会话语义)
+                    stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
+                                   curses.color_pair(13))
+                    a_title = curses.color_pair(15 if current else 13)
+                    a_time = curses.color_pair(14)
+                    a_glyph = curses.color_pair(CURSOR_BG.get(kind, 14))
                 else:
-                    a_title = curses.color_pair(1)
-                stdscr.addnstr(y, 1, marker, 1,
-                               curses.color_pair(5 if selected else 3))
+                    a_title = curses.color_pair(5 if current else 1)
+                    a_time = curses.color_pair(3)
+                    a_glyph = curses.color_pair(KIND_PAIR.get(kind, 3))
                 stdscr.addnstr(y, 2, title, W - 2, a_title)
                 x_time = W - 2 - cell_len(gch) - 1 - cell_len(t)
-                stdscr.addnstr(y, max(2, x_time), t, W - 2,
-                               curses.color_pair(3))
-                stdscr.addnstr(y, W - 2, gch, 1, curses.color_pair(gpair))
+                stdscr.addnstr(y, max(2, x_time), t, W - 2, a_time)
+                stdscr.addnstr(y, W - 2, gch, 1, a_glyph)
                 self.row_at[y] = i
             y += 1
 
@@ -548,6 +556,12 @@ class App:
         curses.init_pair(9, YELLOW, -1)
         curses.init_pair(10, RED, -1)
         curses.init_pair(12, 250, 236)   # SESSIONS 底色带
+        curses.init_pair(13, 255, 236)   # 焦点行: 标题
+        curses.init_pair(14, 240, 236)   # 焦点行: 时间/暗色
+        curses.init_pair(15, ACCENT, 236)  # 焦点行: 珊瑚
+        curses.init_pair(16, GREEN, 236)
+        curses.init_pair(17, YELLOW, 236)
+        curses.init_pair(18, RED, 236)
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS
                              | curses.REPORT_MOUSE_POSITION)
@@ -572,10 +586,10 @@ class App:
                 self.last_pane_check = now
                 if not self.right_pane_alive():
                     return
-            # rail 宽度统一: 偏了就纠回
+            # rail 安全兜底: 只在窄于 RAIL_W 时纠回(绝不妨碍展开)
             if self.rail and now - self.last_fix > W_COOLDOWN:
                 H, W = stdscr.getmaxyx()
-                if W != CFG["RAIL_W"]:
+                if W < CFG["RAIL_W"]:
                     self.last_fix = now
                     p = sidebar_pane_id()
                     if p:

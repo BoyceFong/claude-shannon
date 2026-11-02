@@ -1,6 +1,7 @@
 #!/bin/sh
 # shannon-workspace [project-dir] — 左栏会话列表 + 右栏 claude 宿主的工作区。
-# 右栏由 shannon-host 托管,永不退出;初始显示 fleet view (SHANNON_START 可改 blank)。
+# 布局用 tmux 的 main-vertical: 侧栏是主面板, 宽度由 main-pane-width 固定,
+# 窗口变化时 tmux 只伸缩右栏 —— 侧栏宽度天然恒定, 不靠事后纠正。
 # 已有工作区则直接附加;宿主面板关闭(q)时整个工作区随之结束。
 
 set -e
@@ -9,6 +10,10 @@ STATE_DIR="$HOME/.claude/shannon"
 SESS="${SHANNON_SESSION:-shannon}"
 mkdir -p "$STATE_DIR"
 DIR="${1:-$PWD}"
+
+if tmux has-session -t "$SESS" 2>/dev/null; then
+  exec tmux attach-session -t "$SESS"
+fi
 
 # 配置文件(首次写入默认值,之后以文件为准;run-shell 不继承 shell 环境变量)
 if [ ! -f "$STATE_DIR/config" ]; then
@@ -28,20 +33,19 @@ case "$INIT_W" in ''|*[!0-9]*) INIT_W=$SIDEBAR_W ;; esac
 [ "$INIT_W" -ge 12 ] 2>/dev/null || INIT_W=$SIDEBAR_W
 [ "$INIT_W" -le 35 ] 2>/dev/null || INIT_W=35
 
-if tmux has-session -t "$SESS" 2>/dev/null; then
-  exec tmux attach-session -t "$SESS"
-fi
-
-# pane 0 = 右栏宿主(整宽);先锁定宿主 pane id(split -b 后索引按位置重排,
-# 必须用 id 而不是 0.0 定位宿主),再向左切出侧栏
-HOST_PANE=$(tmux new-session -d -s "$SESS" -c "$DIR" -P -F '#{pane_id}' \
+# 先起侧栏(main-vertical 的主面板 = 最先创建的面板), 再向右切出宿主
+SIDEBAR_PANE=$(tmux new-session -d -s "$SESS" -c "$HOME" -P -F '#{pane_id}' \
+  "$BIN_DIR/shannon-sidebar")
+HOST_PANE=$(tmux split-window -h -t "$SIDEBAR_PANE" -c "$DIR" -P -F '#{pane_id}' \
   env SHANNON_START="${SHANNON_START:-fleet}" SHANNON_DIR="$DIR" "$BIN_DIR/shannon-host")
-SIDEBAR_PANE=$(tmux split-window -h -b -l "$INIT_W" -t "$HOST_PANE" \
-  -c "$HOME" -P -F '#{pane_id}' "$BIN_DIR/shannon-sidebar" || true)
 printf '%s\n' "$HOST_PANE" > "$STATE_DIR/host-pane"
 printf '%s\n' "$SIDEBAR_PANE" > "$STATE_DIR/sidebar-pane"
 printf 'fleet\n' > "$STATE_DIR/current-session"
 printf '%s\n' auto > "$STATE_DIR/mode"
+
+# main-vertical + main-pane-width: 窗口变化时侧栏宽度由 tmux 保持恒定
+tmux set-window-option -t "$SESS:0" main-pane-width "$INIT_W"
+tmux select-layout -t "$SESS:0" main-vertical
 
 # 极简观感: 单条 dim 分隔线,无边框无标题 (选项失败不致命)
 tmux set-option -t "$SESS" mouse on || true
@@ -51,8 +55,9 @@ tmux set-option -t "$SESS" pane-border-status off || true
 tmux set-option -g escape-time 0 || true
 tmux set-option -t "$SESS" status off || true
 
-# M-s 折叠/展开;宽度变化交给 autofit (session 钩子 + 全局兜底)
+# M-s 折叠/展开 · M-q 退出工作区;宽度阈值变化交给 autofit
 tmux bind-key -n M-s run-shell "$BIN_DIR/shannon-toggle" || true
+tmux bind-key -n M-q kill-session || true
 tmux set-hook -t "$SESS" client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
 tmux set-hook -g client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
 

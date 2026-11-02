@@ -1,7 +1,7 @@
 #!/bin/sh
 # shannon-toggle — 折叠/展开侧栏 (M-s、◀ 或 rail 上的 ▶)。
-# 折叠 = 侧栏收窄成 RAIL_W(程序自己切成 rail 模式,保留展开按钮);
-# 展开 = 恢复记忆宽度。面板始终存在,不再 kill。
+# 通过 main-pane-width + main-vertical 布局切换, 面板不销毁;
+# 若布局未生效(面板次序异常)则退回 resize-pane 纠正。
 
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 STATE_DIR="$HOME/.claude/shannon"
@@ -11,7 +11,7 @@ SIDEBAR_W=${SIDEBAR_W:-35}
 RAIL_W=${RAIL_W:-2}
 
 # 展开宽度 = 用户记忆值, 限制在 [12, 35]
-EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null)
+EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
 case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
 [ "$EXPAND_W" -ge 12 ] 2>/dev/null || EXPAND_W=$SIDEBAR_W
 [ "$EXPAND_W" -le 35 ] 2>/dev/null || EXPAND_W=35
@@ -23,11 +23,17 @@ CW=$(tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null)
 
 case "$CW" in
   [1-9])
-    # rail → 展开(恢复记忆宽度)
-    tmux resize-pane -t "$SB" -x "$EXPAND_W" && echo auto > "$STATE_DIR/mode"
+    TARGET=$EXPAND_W; MODE=auto      # rail → 展开(恢复记忆宽度)
     ;;
   *)
-    # 完整 → rail
-    tmux resize-pane -t "$SB" -x "$RAIL_W" && echo manual > "$STATE_DIR/mode"
+    TARGET=$RAIL_W; MODE=manual      # 完整 → rail(手动折叠, autofit 尊重)
     ;;
 esac
+
+tmux set-window-option -t "$SESS:0" main-pane-width "$TARGET" 2>/dev/null
+tmux select-layout -t "$SESS:0" main-vertical 2>/dev/null
+CW2=$(tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null)
+if [ "$CW2" != "$TARGET" ]; then
+  tmux resize-pane -t "$SB" -x "$TARGET" 2>/dev/null
+fi
+echo "$MODE" > "$STATE_DIR/mode"
