@@ -22,7 +22,8 @@ fi
 SIDEBAR_W=${SIDEBAR_W:-35}
 
 # 初始侧栏宽度优先用上次记住的展开宽度, 限制在 [12, 35]
-INIT_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null)
+# (|| true 兜底: set -e 下文件不存在时 cat 的失败不能杀死脚本)
+INIT_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
 case "$INIT_W" in ''|*[!0-9]*) INIT_W=$SIDEBAR_W ;; esac
 [ "$INIT_W" -ge 12 ] 2>/dev/null || INIT_W=$SIDEBAR_W
 [ "$INIT_W" -le 35 ] 2>/dev/null || INIT_W=35
