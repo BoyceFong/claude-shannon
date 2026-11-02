@@ -1,0 +1,27 @@
+#!/bin/sh
+# shannon-host — 右栏宿主: 面板永不退出,claude 只是它的内容。
+#   SHANNON_DIR     工作目录
+#   SHANNON_START   fleet(默认, 右栏显示 claude agents) | blank(空 claude)
+#   SHANNON_RESUME  指定要加载的会话 id (侧栏点击时由 respawn 注入)
+# claude 退出后停在提示页: 回车重启同一内容, 输入 q 回车收工(面板关闭)。
+
+STATE_DIR="$HOME/.claude/shannon"
+CLAUDE_BIN=$(command -v claude || echo /opt/homebrew/bin/claude)
+cd "${SHANNON_DIR:-$HOME}" || cd "$HOME"
+
+while :; do
+  if [ -n "${SHANNON_RESUME:-}" ]; then
+    "$CLAUDE_BIN" --resume "$SHANNON_RESUME"
+  elif [ "${SHANNON_START:-fleet}" = "fleet" ]; then
+    "$CLAUDE_BIN" agents
+  else
+    "$CLAUDE_BIN"
+  fi
+  code=$?
+  printf '%s claude exit=%s start=%s resume=%s\n' \
+    "$(date '+%H:%M:%S')" "$code" "${SHANNON_START:-fleet}" \
+    "${SHANNON_RESUME:--}" >> "$STATE_DIR/host.log" 2>/dev/null
+  printf '\n· claude 已退出 (code %s) — 回车重启 · 输入 q 回车收工\n' "$code"
+  read -r k
+  [ "$k" = q ] && break
+done

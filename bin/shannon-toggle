@@ -1,0 +1,32 @@
+#!/bin/sh
+# shannon-toggle — 折叠/展开侧栏 (M-s、◀ 或 rail 上的 ❯)。
+# 折叠 = 侧栏收窄成 RAIL_W 的细条(程序自己切成 rail 模式,保留展开按钮);
+# 展开 = 恢复 SIDEBAR_W。面板始终存在,不再 kill。
+
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+STATE_DIR="$HOME/.claude/shannon"
+SESS="${SHANNON_SESSION:-shannon}"
+. "$STATE_DIR/config" 2>/dev/null || true
+SIDEBAR_W=${SIDEBAR_W:-36}
+RAIL_W=${RAIL_W:-2}
+
+# 展开宽度优先用用户上次拖拽后记住的宽度
+EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null)
+case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
+[ "$EXPAND_W" -ge 12 ] 2>/dev/null || EXPAND_W=$SIDEBAR_W
+
+SB=$(cat "$STATE_DIR/sidebar-pane" 2>/dev/null)
+[ -n "$SB" ] || exit 0
+CW=$(tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null)
+[ -n "$CW" ] || exit 0
+
+case "$CW" in
+  [1-9])
+    # rail → 展开(恢复记忆宽度)
+    tmux resize-pane -t "$SB" -x "$EXPAND_W" && echo manual > "$STATE_DIR/mode"
+    ;;
+  *)
+    # 完整 → rail
+    tmux resize-pane -t "$SB" -x "$RAIL_W" && echo manual > "$STATE_DIR/mode"
+    ;;
+esac

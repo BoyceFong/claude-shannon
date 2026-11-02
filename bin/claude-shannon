@@ -1,0 +1,20 @@
+#!/bin/sh
+# claude-shannon — `claude shannon` 的入口:
+# 定位最近活跃的项目, 进入/附加工作区(左栏会话列表 + 右栏 claude)。
+
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+latest=$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -n 1)
+if [ -n "$latest" ] && [ -f "$latest" ]; then
+  project=$(head -n 20 "$latest" | python3 -c '
+import sys, json
+for line in sys.stdin:
+    try:
+        o = json.loads(line)
+    except (ValueError, TypeError):
+        continue
+    if isinstance(o, dict) and o.get("cwd"):
+        print(o["cwd"])
+        break
+' 2>/dev/null)
+fi
+exec "$BIN_DIR/shannon-workspace" "${project:-$PWD}"

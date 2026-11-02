@@ -1,0 +1,53 @@
+#!/bin/sh
+# shannon-workspace [project-dir] — 左栏会话列表 + 右栏 claude 宿主的工作区。
+# 右栏由 shannon-host 托管,永不退出;初始显示 fleet view (SHANNON_START 可改 blank)。
+# 已有工作区则直接附加;宿主面板关闭(q)时整个工作区随之结束。
+
+set -e
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+STATE_DIR="$HOME/.claude/shannon"
+SESS="${SHANNON_SESSION:-shannon}"
+mkdir -p "$STATE_DIR"
+DIR="${1:-$PWD}"
+
+# 配置文件(首次写入默认值,之后以文件为准;run-shell 不继承 shell 环境变量)
+if [ ! -f "$STATE_DIR/config" ]; then
+  {
+    echo "SIDEBAR_W=${SHANNON_SIDEBAR_W:-36}"
+    echo "COLLAPSE_AT=${SHANNON_COLLAPSE_AT:-96}"
+    echo "RAIL_W=2"
+  } > "$STATE_DIR/config"
+fi
+. "$STATE_DIR/config"
+SIDEBAR_W=${SIDEBAR_W:-36}
+
+if tmux has-session -t "$SESS" 2>/dev/null; then
+  exec tmux attach-session -t "$SESS"
+fi
+
+# pane 0 = 右栏宿主(整宽);先锁定宿主 pane id(split -b 后索引按位置重排,
+# 必须用 id 而不是 0.0 定位宿主),再向左切出侧栏
+HOST_PANE=$(tmux new-session -d -s "$SESS" -c "$DIR" -P -F '#{pane_id}' \
+  env SHANNON_START="${SHANNON_START:-fleet}" SHANNON_DIR="$DIR" "$BIN_DIR/shannon-host")
+SIDEBAR_PANE=$(tmux split-window -h -b -l "$SIDEBAR_W" -t "$HOST_PANE" \
+  -c "$HOME" -P -F '#{pane_id}' "$BIN_DIR/shannon-sidebar" || true)
+printf '%s\n' "$HOST_PANE" > "$STATE_DIR/host-pane"
+printf '%s\n' "$SIDEBAR_PANE" > "$STATE_DIR/sidebar-pane"
+printf 'fleet\n' > "$STATE_DIR/current-session"
+printf '%s\n' auto > "$STATE_DIR/mode"
+
+# 极简观感: 单条 dim 分隔线,无边框无标题 (选项失败不致命)
+tmux set-option -t "$SESS" mouse on || true
+tmux set-option -t "$SESS" pane-border-lines single || true
+tmux set-option -t "$SESS" pane-border-style "fg=colour239" || true
+tmux set-option -t "$SESS" pane-border-status off || true
+tmux set-option -g escape-time 0 || true
+tmux set-option -t "$SESS" status off || true
+
+# M-s 折叠/展开;宽度变化交给 autofit (session 钩子 + 全局兜底)
+tmux bind-key -n M-s run-shell "$BIN_DIR/shannon-toggle" || true
+tmux set-hook -t "$SESS" client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
+tmux set-hook -g client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
+
+tmux select-pane -t "$HOST_PANE"
+exec tmux attach-session -t "$SESS"

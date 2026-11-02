@@ -1,0 +1,47 @@
+#!/bin/sh
+# shannon-autofit — tmux client-resized 钩子:
+#   窗口宽 < COLLAPSE_AT → 侧栏收成 rail(保留 ❯ 展开按钮,永不消失)
+#   窗口宽恢复且之前是自动收起 → 自动展开
+#   侧栏面板不存在且宽度足够 → 重新切出
+# 手动折叠(mode=manual)只影响自动展开,不影响自动收起。
+
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+STATE_DIR="$HOME/.claude/shannon"
+SESS="${SHANNON_SESSION:-shannon}"
+. "$STATE_DIR/config" 2>/dev/null || true
+SIDEBAR_W=${SIDEBAR_W:-36}
+RAIL_W=${RAIL_W:-2}
+COLLAPSE_AT=${COLLAPSE_AT:-96}
+
+# 展开宽度优先用用户上次拖拽后记住的宽度
+EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null)
+case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
+[ "$EXPAND_W" -ge 12 ] 2>/dev/null || EXPAND_W=$SIDEBAR_W
+
+HOST_PANE=$(cat "$STATE_DIR/host-pane" 2>/dev/null)
+[ -n "$HOST_PANE" ] || exit 0
+SB=$(cat "$STATE_DIR/sidebar-pane" 2>/dev/null)
+W=$(tmux display-message -p -t "$SESS" '#{client_width}' 2>/dev/null)
+[ -n "$W" ] || exit 0
+MODE=$(cat "$STATE_DIR/mode" 2>/dev/null)
+
+if [ "$W" -lt "$COLLAPSE_AT" ]; then
+  # 太窄: 收成 rail
+  if [ -n "$SB" ]; then
+    CW=$(tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null)
+    case "$CW" in [1-9]) ;; *) tmux resize-pane -t "$SB" -x "$RAIL_W" ;; esac
+  fi
+  echo auto-collapsed > "$STATE_DIR/mode"
+elif [ "$MODE" = "auto-collapsed" ]; then
+  # 宽度恢复且是自动收起的 → 展开(恢复记忆宽度)
+  if [ -n "$SB" ]; then
+    CW=$(tmux display-message -p -t "$SB" '#{pane_width}' 2>/dev/null)
+    case "$CW" in
+      [1-9]) tmux resize-pane -t "$SB" -x "$EXPAND_W" ;;
+    esac
+  elif [ -n "$HOST_PANE" ]; then
+    tmux split-window -h -b -l "$EXPAND_W" -t "$HOST_PANE" \
+      -c "$HOME" "$BIN_DIR/shannon-sidebar"
+  fi
+  echo auto > "$STATE_DIR/mode"
+fi
