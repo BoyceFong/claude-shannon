@@ -310,18 +310,32 @@ class App:
         self.msg = ""
         self.msg_until = 0.0
         self.footer_btn_x = -1  # ◀ 收起 的可点击起点
+        self.open_zone = None   # ↵ 打开 的点击范围
+        self.exit_zone = None   # ✕ 退出 的点击范围
         self.row_at = {}        # 屏幕行号 → display 行序号
         self.last_pane_check = 0.0
         self.last_fix = 0.0
         self.last_w_check = 0.0
+        self.last_act = 0.0     # 点击动作防抖
         self.last_saved_w = 0   # 已记忆的展开宽度,避免重复写
 
+    def act(self, fn):
+        """点击动作防抖: 180ms 内的重复事件忽略"""
+        now = time.time()
+        if now - self.last_act < 0.18:
+            return
+        self.last_act = now
+        fn()
+
+    def quit_session(self):
+        tmux("kill-session", "-t", SESSION)
+
     def remember_width(self, stdscr):
-        """展开状态下把当前宽度记入状态文件(展开时恢复用)"""
+        """展开状态下把当前宽度记入状态文件(展开时恢复用), 上限 35"""
         if self.rail:
             return
         H, W = stdscr.getmaxyx()
-        if W >= MIN_W_SAVE and W != self.last_saved_w:
+        if MIN_W_SAVE <= W <= 35 and W != self.last_saved_w:
             self.last_saved_w = W
             save_expanded_width(W)
 
@@ -407,12 +421,14 @@ class App:
         stdscr.erase()
         self.row_at = {}
 
-        # 头部: SESSIONS(亮灰加粗,与项目名区分) + 展示条数
-        stdscr.addnstr(0, 1, "SESSIONS", W - 2,
-                       curses.color_pair(4) | curses.A_BOLD)
+        # 头部: SESSIONS 带灰色底带,与项目名明确区分
+        band = curses.color_pair(12) | curses.A_BOLD
+        stdscr.addnstr(0, 1, "SESSIONS", W - 2, band)
+        if W > 9:
+            stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
         if row_idx:
-            stdscr.addnstr(0, max(1, W - 1 - cell_len(str(len(row_idx)))),
-                           str(len(row_idx)), W, curses.color_pair(3))
+            cnt = str(len(row_idx))
+            stdscr.addnstr(0, max(2, W - 1 - cell_len(cnt)), cnt, W - 2, band)
 
         # 列表
         y = 1
@@ -434,10 +450,8 @@ class App:
                 room = max(6, W - cell_len(t) - 6)
                 title = trunc(row["title"], room)
                 pad = " " * max(1, room - cell_len(title) + 1)
-                if selected:
-                    a_title = curses.color_pair(6)
-                elif current:
-                    a_title = curses.color_pair(5)
+                if selected or current:
+                    a_title = curses.color_pair(5)   # 选中/当前 → 珊瑚色
                 else:
                     a_title = curses.color_pair(1)
                 stdscr.addnstr(y, 1, marker, 1,
@@ -456,10 +470,14 @@ class App:
             stdscr.addnstr(1, 1, "no conversations yet", W - 2,
                            curses.color_pair(3))
 
-        # 底部: 左"↵ 打开" · 右"◀ 收起"(可点击)
+        # 底部: "↵ 打开 · ✕ 退出"(可点击) + "◀ 收起"(可点击)
+        left = "↵ 打开 · ✕ 退出"
         btn = "◀ 收起"
         self.footer_btn_x = max(1, W - 1 - cell_len(btn))
-        stdscr.addnstr(H - 1, 1, "↵ 打开", W - 2, curses.color_pair(3))
+        self.open_zone = (1, cell_len("↵ 打开"))
+        self.exit_zone = (1 + cell_len("↵ 打开 · "),
+                          cell_len("↵ 打开 · ✕ 退出"))
+        stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(3))
         stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
                        curses.color_pair(5))
         stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
@@ -485,17 +503,27 @@ class App:
 
     def click(self, my, mx, H, items, row_idx):
         if self.rail:
-            subprocess.run([TOGGLE])   # rail 上点击 → 展开
+            self.act(lambda: subprocess.run([TOGGLE]))   # rail 点击 → 展开
             return
-        if my == H - 1 and mx >= self.footer_btn_x:
-            subprocess.run([TOGGLE])   # ◀ → 收成 rail(面板保留)
+        if my == H - 1:
+            # 底部按钮区: ↵ 打开 · ✕ 退出 · ◀ 收起(命中区放宽一格)
+            if (self.open_zone and self.open_zone[0] <= mx <= self.open_zone[1]
+                    and row_idx):
+                self.open_selected(items, row_idx)
+            elif (self.exit_zone
+                  and self.exit_zone[0] <= mx <= self.exit_zone[1]):
+                self.act(self.quit_session)
+            elif mx >= self.footer_btn_x - 1:
+                self.act(lambda: subprocess.run([TOGGLE]))
             return
         if my in self.row_at:
             idx = self.row_at[my]
             if idx < len(items) and items[idx][0] == "row":
-                if idx in row_idx:
-                    self.sel = row_idx.index(idx)   # 竖条跟随点击行
-                self.toast(activate(items[idx][1]))
+                def open_row():
+                    if idx in row_idx:
+                        self.sel = row_idx.index(idx)   # 竖条跟随点击行
+                    self.toast(activate(items[idx][1]))
+                self.act(open_row)
 
     def right_pane_alive(self):
         pane = host_pane_id()
@@ -519,6 +547,7 @@ class App:
         curses.init_pair(8, GREEN, -1)
         curses.init_pair(9, YELLOW, -1)
         curses.init_pair(10, RED, -1)
+        curses.init_pair(12, 250, 236)   # SESSIONS 底色带
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS
                              | curses.REPORT_MOUSE_POSITION)

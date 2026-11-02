@@ -59,7 +59,9 @@ Every other `claude` usage passes through untouched.
 - **Live status dots** — working (coral), awaiting input (yellow), done (green), stopped (gray), failed (red); idle history shows a hollow dot.
 - **In-place switching** — clicking a row respawns the right pane's Claude host on that conversation. Works across projects, not just the current one.
 - **Fleet view as home screen** — the right pane starts on Claude Code's own fleet view; everything you can do there, you can do here.
-- **Collapse to a rail** — `M-s` or the `◀` button shrinks the sidebar to a 2-column rail with a `▶` expand button. Nothing is ever destroyed.
+- **Collapse to a rail** — `M-s` or the `◀ 收起` button shrinks the sidebar to a 2-column rail with a `▶` expand button at the bottom. Nothing is ever destroyed.
+- **Quit from the sidebar** — `✕ 退出` in the footer closes the whole workspace.
+- **Pinned widths** — while you resize the window, an enforcer hook re-pins the sidebar to your width on every change; only the right pane flexes.
 - **Auto-fit** — below `COLLAPSE_AT` columns the sidebar auto-collapses so Claude keeps a usable width; it restores itself when the window grows.
 - **Width memory** — drag the divider to whatever width you like; it sticks across collapse/expand cycles.
 - **Stable ordering** — loading a conversation never shuffles the list; order is frozen when the workspace opens.
@@ -70,9 +72,11 @@ Every other `claude` usage passes through untouched.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `SIDEBAR_W` | `36` | Expanded sidebar width, in columns |
-| `COLLAPSE_AT` | `96` | Window width below which the sidebar auto-collapses to the rail |
+| `SIDEBAR_W` | `35` | Fallback expanded sidebar width (columns) |
+| `COLLAPSE_AT` | `70` | Window width below which the sidebar auto-collapses to the rail |
 | `RAIL_W` | `2` | Collapsed rail width |
+
+The expanded width you set by dragging the divider is remembered in `~/.claude/shannon/sidebar-w` (clamped to 12–35 columns) and survives restarts.
 
 ## How it works
 
