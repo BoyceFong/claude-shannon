@@ -609,9 +609,21 @@ class App:
         curses.init_pair(24, YELLOW, 234)
         curses.init_pair(25, RED, 234)
         try:
+            curses.mouseinterval(0)   # 点击改用 PRESSED 上报, motion 即时生效
+        except curses.error:
+            pass
+        try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS
                              | curses.REPORT_MOUSE_POSITION)
         except curses.error:
+            pass
+        # ncurses 经 terminfo 的鼠标编码在 tmux 下不转发悬停移动;
+        # 直接开启 SGR 1003/1006, tmux 会把 motion 转发给本面板
+        try:
+            import sys as _sys
+            _sys.stdout.write("\x1b[?1003;1006h")
+            _sys.stdout.flush()
+        except Exception:
             pass
 
         self.last_version = -1
@@ -746,7 +758,8 @@ class App:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
                 H = stdscr.getmaxyx()[0]
-                if bstate & curses.BUTTON1_CLICKED:
+                if bstate & (curses.BUTTON1_CLICKED
+                             | curses.BUTTON1_PRESSED):
                     self.last_motion = time.time()
                     self.click(my, mx, H, items, row_idx)
                     self.draw(stdscr)
