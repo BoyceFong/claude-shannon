@@ -56,7 +56,8 @@ Every other `claude` usage passes through untouched.
 ## Features
 
 - **Cross-project session list** — recent conversations from `~/.claude/projects`, grouped by workspace, newest first.
-- **Live status dots** — working (coral), awaiting input (yellow), done (green), stopped (gray), failed (red); idle history shows a hollow dot.
+- **Live status icons, aligned with Claude Code's fleet view** — working: animated spinner (coral); awaiting input: `✱` (yellow); done: `∙` (green); stopped/idle: `∙` (gray); failed: `✱` (red).
+- **Hover highlights** — rows, `◀` `▶` `✕` buttons light up under the pointer, like the fleet view.
 - **In-place switching** — clicking a row respawns the right pane's Claude host on that conversation. Works across projects, not just the current one.
 - **Fleet view as home screen** — the right pane starts on Claude Code's own fleet view; everything you can do there, you can do here.
 - **Collapse to a rail** — `M-s` or the `◀ 收起` button shrinks the sidebar to a 2-column rail with a `▶` expand button at the bottom. Nothing is ever destroyed.
@@ -68,12 +69,12 @@ Every other `claude` usage passes through untouched.
 | Key | Action |
 | --- | --- |
 | `M-s` (Alt+S) | Collapse / expand the sidebar |
-| `M-q` (Alt+Q) | Quit the workspace |
-| `↑` `↓` / `j` `k` | Move the selection (gray highlight) |
+| `C-q` (Ctrl+Q) | Quit the workspace |
+| `↑` `↓` / `j` `k` | Move the selection (gray highlight band; Enter clears it until the next arrow key) |
 | `Enter` | Open the selected session in the right pane |
-| Mouse | Click rows, `◀` `▶` `✕` buttons; drag the divider to resize |
+| Mouse | Click rows and buttons (hover highlights first — no focus click needed); drag the divider to resize |
 
-> macOS `⌘` chords never reach the terminal (the GUI intercepts them), so `⌘X` cannot be bound inside tmux. If you want a Cmd-style quit, map `⌘Q` → "send Alt+Q" in your terminal's keyboard settings.
+> macOS `⌘` chords never reach the terminal (the GUI intercepts them), so `⌘X`/`⌘Q` cannot be bound inside tmux — hence Ctrl+Q for quit. If you prefer a Cmd-style quit, map `⌘Q` → "send Ctrl+Q" in your terminal's keyboard settings.
 - **Auto-fit** — below `COLLAPSE_AT` columns the sidebar auto-collapses so Claude keeps a usable width; it restores itself when the window grows.
 - **Width memory** — drag the divider to whatever width you like; it sticks across collapse/expand cycles.
 - **Stable ordering** — loading a conversation never shuffles the list; order is frozen when the workspace opens.

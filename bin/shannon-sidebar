@@ -20,13 +20,17 @@ PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 STATE_DIR = os.path.join(HOME, ".claude", "shannon")
 SESSION = os.environ.get("SHANNON_SESSION", "shannon")
 TOGGLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shannon-toggle")
+AUTOFIT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shannon-autofit")
 
 SCAN_LIMIT = 48          # 最多读多少个最新的会话文件
 REFRESH_SECS = 15        # 数据刷新周期
 MAX_GROUPS = 12
 PER_GROUP = 6
 MIN_W_SAVE = 12          # 记忆展开宽度时的下限
-W_COOLDOWN = 3.0         # rail 宽度自纠的最小间隔(秒)
+MAX_W = 35               # 记忆展开宽度的上限
+W_COOLDOWN = 3.0         # rail 兜底纠宽的最小间隔(秒)
+DEFEND_COOLDOWN = 1.0    # 窄窗自防(请 autofit 收 rail)的最小间隔(秒)
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # 工作中: 动态菊花帧, 对齐 Claude Code
 
 ACCENT = 209             # 珊瑚 #d7875f(近 Anthropic D97757)
 GREEN = 114
@@ -35,7 +39,7 @@ RED = 167
 
 
 def load_config() -> dict:
-    cfg = {"SIDEBAR_W": 36, "COLLAPSE_AT": 96, "RAIL_W": 2}
+    cfg = {"SIDEBAR_W": 35, "COLLAPSE_AT": 70, "RAIL_W": 2}
     try:
         with open(os.path.join(STATE_DIR, "config")) as fh:
             for line in fh:
@@ -216,7 +220,7 @@ def expanded_width() -> int:
     try:
         with open(os.path.join(STATE_DIR, "sidebar-w")) as fh:
             v = fh.read().strip()
-        if v.isdigit() and MIN_W_SAVE <= int(v) <= 200:
+        if v.isdigit() and MIN_W_SAVE <= int(v) <= MAX_W:
             return int(v)
     except OSError:
         pass
@@ -244,29 +248,31 @@ def live_status() -> dict:
 
 
 def status_glyph(sid: str, live: dict) -> tuple:
-    """(字符, 状态种类) — 行尾状态圆点; 色对由绘制层按焦点状态决定"""
+    """(字符或 None=菊花动画, 状态种类) — 对齐 Claude Code fleet view"""
     st = live.get(sid)
     if st is None:
-        return ("○", "idle")                 # 历史(未运行)
+        return ("∙", "idle")                 # 历史(未运行)
     s = st.lower()
     if sid == current_session_id():
-        return ("●", "accent")               # 右栏当前会话
+        return (None, "accent")              # 右栏当前会话(菊花)
     if "input" in s or "wait" in s:
-        return ("●", "yellow")               # 等待输入
+        return ("✱", "yellow")               # 等待用户输入
     if s in ("busy", "working", "active", "running"):
-        return ("●", "accent")               # 工作中
+        return (None, "accent")              # 工作中(菊花)
     if s in ("done", "completed"):
-        return ("●", "green")                # 完成
+        return ("∙", "green")                # 完成
     if "fail" in s or "error" in s:
-        return ("●", "red")                  # 失败
-    return ("●", "dim")                      # 已停止/退出
+        return ("✱", "red")                  # 失败
+    return ("∙", "dim")                      # 已停止/退出
 
 
 KIND_PAIR = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
              "dim": 3, "idle": 3}
-# 焦点行(灰底)使用的同色系变体(前景不变, 底色 236)
+# 焦点行(灰底 236)与悬停行(灰底 234)的同色系变体
 CURSOR_BG = {"accent": 15, "green": 16, "yellow": 17, "red": 18,
              "dim": 14, "idle": 14}
+HOVER_BG = {"accent": 22, "green": 23, "yellow": 24, "red": 25,
+            "dim": 21, "idle": 21}
 
 
 # ---------------------------------------------------------------- 操作
@@ -310,20 +316,24 @@ class App:
         self.order = None            # 首次加载时冻结的排序基准(id → mtime)
         threading.Thread(target=self.refresh_loop, daemon=True).start()
 
-        self.sel = 0            # 选中行在 display 行里的序号
+        self.sel = 0            # 焦点行在 display 行里的序号
+        self.focus_visible = True
         self.offset = 0         # 滚动
         self.rail = False       # rail 模式(收窄成细条)
+        self.hover = None       # ('row', idx) | ('collapse',) | ('exit',) | ('rail',)
         self.msg = ""
         self.msg_until = 0.0
-        self.footer_btn_x = -1  # ◀ 收起 的可点击起点
-        self.open_zone = None   # ↵ 打开 的点击范围
+        self.footer_btn_x = -1
         self.exit_zone = None   # ✕ 退出 的点击范围
         self.row_at = {}        # 屏幕行号 → display 行序号
         self.last_pane_check = 0.0
         self.last_fix = 0.0
+        self.last_defend = 0.0
         self.last_w_check = 0.0
         self.last_act = 0.0     # 点击动作防抖
-        self.last_saved_w = 0   # 已记忆的展开宽度,避免重复写
+        self.last_motion = 0.0
+        self.last_saved_w = 0
+        self.last_ww = None     # 上次见到的窗口宽度(区分拖分隔条/缩放窗口)
 
     def act(self, fn):
         """点击动作防抖: 180ms 内的重复事件忽略"""
@@ -335,15 +345,6 @@ class App:
 
     def quit_session(self):
         tmux("kill-session", "-t", SESSION)
-
-    def remember_width(self, stdscr):
-        """展开状态下把当前宽度记入状态文件(展开时恢复用), 上限 35"""
-        if self.rail:
-            return
-        H, W = stdscr.getmaxyx()
-        if MIN_W_SAVE <= W <= 35 and W != self.last_saved_w:
-            self.last_saved_w = W
-            save_expanded_width(W)
 
     # -- 后台刷新 -----------------------------------------------------
     def refresh_loop(self):
@@ -404,8 +405,11 @@ class App:
             self.rail = True
             stdscr.erase()
             gx = max(0, min(1, W - 2))
-            stdscr.addnstr(H - 1, gx, "▶", 1,
-                           curses.color_pair(5) | curses.A_BOLD)
+            if self.hover == ("rail",):
+                stdscr.addnstr(H - 1, gx, "▶", 1, curses.color_pair(22))
+            else:
+                stdscr.addnstr(H - 1, gx, "▶", 1,
+                               curses.color_pair(5) | curses.A_BOLD)
             stdscr.refresh()
             return
         self.rail = False
@@ -415,8 +419,8 @@ class App:
         self.sel = max(0, min(self.sel, len(row_idx) - 1))
         view_rows = max(1, H - 2)
 
-        # 滚动: 选中行保持可见
-        if row_idx:
+        # 滚动: 焦点行保持可见
+        if row_idx and self.focus_visible:
             sel_item = row_idx[self.sel]
             if sel_item < self.offset:
                 self.offset = sel_item
@@ -447,24 +451,34 @@ class App:
                                curses.color_pair(2) | curses.A_BOLD)
             else:
                 row = payload
-                cursor = (self.sel < len(row_idx)
+                cursor = (self.focus_visible
+                          and self.sel < len(row_idx)
                           and row_idx[self.sel] == i)
+                hovered = self.hover == ("row", i)
                 current = row["id"] == current_session_id()
                 t = ago(row["mtime"], now_ms)
-                gch, kind = status_glyph(row["id"], live)
+                gch, gkind = status_glyph(row["id"], live)
                 room = max(6, W - cell_len(t) - 6)
                 title = trunc(row["title"], room)
+                if gch is None:   # 工作中 → 菊花当前帧
+                    gch = SPINNER[int(now_ms / 120) % len(SPINNER)]
                 if cursor:
-                    # 键盘/点击焦点: 整行灰底带(珊瑚色只属于当前会话语义)
-                    stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
-                                   curses.color_pair(13))
-                    a_title = curses.color_pair(15 if current else 13)
+                    a_title = curses.color_pair(
+                        15 if current else 13)
                     a_time = curses.color_pair(14)
-                    a_glyph = curses.color_pair(CURSOR_BG.get(kind, 14))
+                    a_glyph = curses.color_pair(CURSOR_BG.get(gkind, 14))
+                elif hovered:
+                    a_title = curses.color_pair(
+                        22 if current else 20)
+                    a_time = curses.color_pair(21)
+                    a_glyph = curses.color_pair(HOVER_BG.get(gkind, 21))
                 else:
                     a_title = curses.color_pair(5 if current else 1)
                     a_time = curses.color_pair(3)
-                    a_glyph = curses.color_pair(KIND_PAIR.get(kind, 3))
+                    a_glyph = curses.color_pair(KIND_PAIR.get(gkind, 3))
+                if cursor:
+                    # 焦点行左侧珊瑚竖条(在灰底带内)
+                    stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
                 stdscr.addnstr(y, 2, title, W - 2, a_title)
                 x_time = W - 2 - cell_len(gch) - 1 - cell_len(t)
                 stdscr.addnstr(y, max(2, x_time), t, W - 2, a_time)
@@ -478,18 +492,25 @@ class App:
             stdscr.addnstr(1, 1, "no conversations yet", W - 2,
                            curses.color_pair(3))
 
-        # 底部: "↵ 打开 · ✕ 退出"(可点击) + "◀ 收起"(可点击)
-        left = "↵ 打开 · ✕ 退出"
+        # 底部: "✕ 退出"(左, 可点击) + "◀ 收起"(右, 可点击)
         btn = "◀ 收起"
+        left = "✕ 退出"
         self.footer_btn_x = max(1, W - 1 - cell_len(btn))
-        self.open_zone = (1, cell_len("↵ 打开"))
-        self.exit_zone = (1 + cell_len("↵ 打开 · "),
-                          cell_len("↵ 打开 · ✕ 退出"))
-        stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(3))
-        stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
-                       curses.color_pair(5))
-        stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
-                       W - self.footer_btn_x - 1, curses.color_pair(3))
+        self.exit_zone = (1, cell_len(left))
+        if self.hover == ("exit",):
+            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(20))
+        else:
+            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(3))
+        if self.hover == ("collapse",):
+            stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
+                           curses.color_pair(22))
+            stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
+                           W - self.footer_btn_x - 1, curses.color_pair(20))
+        else:
+            stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
+                           curses.color_pair(5))
+            stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
+                           W - self.footer_btn_x - 1, curses.color_pair(3))
 
         stdscr.refresh()
 
@@ -502,6 +523,7 @@ class App:
     def move(self, row_idx, delta):
         if not row_idx:
             return
+        self.focus_visible = True       # 上下键从当前焦点出发重新显示高亮
         self.sel = max(0, min(len(row_idx) - 1, self.sel + delta))
 
     def open_selected(self, items, row_idx):
@@ -514,12 +536,8 @@ class App:
             self.act(lambda: subprocess.run([TOGGLE]))   # rail 点击 → 展开
             return
         if my == H - 1:
-            # 底部按钮区: ↵ 打开 · ✕ 退出 · ◀ 收起(命中区放宽一格)
-            if (self.open_zone and self.open_zone[0] <= mx <= self.open_zone[1]
-                    and row_idx):
-                self.open_selected(items, row_idx)
-            elif (self.exit_zone
-                  and self.exit_zone[0] <= mx <= self.exit_zone[1]):
+            # 底部按钮区: ✕ 退出 · ◀ 收起(命中区放宽一格)
+            if (self.exit_zone and self.exit_zone[0] <= mx <= self.exit_zone[1]):
                 self.act(self.quit_session)
             elif mx >= self.footer_btn_x - 1:
                 self.act(lambda: subprocess.run([TOGGLE]))
@@ -529,7 +547,7 @@ class App:
             if idx < len(items) and items[idx][0] == "row":
                 def open_row():
                     if idx in row_idx:
-                        self.sel = row_idx.index(idx)   # 竖条跟随点击行
+                        self.sel = row_idx.index(idx)   # 焦点跟随点击行
                     self.toast(activate(items[idx][1]))
                 self.act(open_row)
 
@@ -543,7 +561,7 @@ class App:
     def run(self, stdscr):
         curses.curs_set(0)
         stdscr.keypad(True)
-        stdscr.timeout(250)
+        stdscr.timeout(120)
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, -1, -1)
@@ -551,17 +569,22 @@ class App:
         curses.init_pair(3, 240, -1)
         curses.init_pair(4, 250, -1)
         curses.init_pair(5, ACCENT, -1)
-        curses.init_pair(6, 255, -1)
         curses.init_pair(8, GREEN, -1)
         curses.init_pair(9, YELLOW, -1)
         curses.init_pair(10, RED, -1)
         curses.init_pair(12, 250, 236)   # SESSIONS 底色带
         curses.init_pair(13, 255, 236)   # 焦点行: 标题
         curses.init_pair(14, 240, 236)   # 焦点行: 时间/暗色
-        curses.init_pair(15, ACCENT, 236)  # 焦点行: 珊瑚
+        curses.init_pair(15, ACCENT, 236)
         curses.init_pair(16, GREEN, 236)
         curses.init_pair(17, YELLOW, 236)
         curses.init_pair(18, RED, 236)
+        curses.init_pair(20, -1, 234)    # 悬停行: 标题
+        curses.init_pair(21, 240, 234)   # 悬停行: 时间/暗色
+        curses.init_pair(22, ACCENT, 234)
+        curses.init_pair(23, GREEN, 234)
+        curses.init_pair(24, YELLOW, 234)
+        curses.init_pair(25, RED, 234)
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS
                              | curses.REPORT_MOUSE_POSITION)
@@ -570,18 +593,25 @@ class App:
 
         self.last_version = -1
         last_minute = -1
+        last_frame = -1
         while True:
             rows, live, ready, version = self.snapshot()
             items = self.display_items(rows)
             row_idx = [i for i, it in enumerate(items) if it[0] == "row"]
-            minute = int(time.time() // 60)
-            if version != self.last_version or minute != last_minute:
+            now = time.time()
+            now_ms = now * 1000
+            minute = int(now // 60)
+            working = any(s in ("busy", "working", "active", "running")
+                          for s in live.values())
+            frame = int(now_ms / 120) % len(SPINNER)
+            if (version != self.last_version or minute != last_minute
+                    or (working and frame != last_frame)):
                 self.draw(stdscr)
                 self.last_version = version
                 last_minute = minute
+                last_frame = frame
 
             # claude 面板没了 → 工作区该结束,侧栏退场
-            now = time.time()
             if now - self.last_pane_check > 5:
                 self.last_pane_check = now
                 if not self.right_pane_alive():
@@ -594,18 +624,28 @@ class App:
                     p = sidebar_pane_id()
                     if p:
                         tmux("resize-pane", "-t", p, "-x", str(CFG["RAIL_W"]))
-            # 展开状态: 周期性记住当前宽度(拖拽/缩放的兜底)
+            # 展开状态被挤压到阈值以下 → 立即请 autofit 收成 rail
+            if not self.rail and now - self.last_defend > DEFEND_COOLDOWN:
+                H, W = stdscr.getmaxyx()
+                if W < CFG["COLLAPSE_AT"]:
+                    self.last_defend = now
+                    subprocess.run([AUTOFIT], capture_output=True, timeout=8)
+            # 展开状态: 周期性记住当前宽度(仅分隔条拖动, 见 remember_width)
             if not self.rail and now - self.last_w_check > 2:
                 self.last_w_check = now
                 self.remember_width(stdscr)
+            # 悬停过期清理(鼠标离开侧栏后不再有 motion 事件)
+            if self.hover and now - self.last_motion > 2.0:
+                self.hover = None
+                self.draw(stdscr)
 
             ch = stdscr.getch()
             if ch == curses.KEY_RESIZE:
                 stdscr.erase()
-                self.draw(stdscr)          # 先重画, rail 标志才是新值
+                self.draw(stdscr)
                 self.remember_width(stdscr)
             elif self.rail and ch not in (-1, curses.KEY_MOUSE):
-                subprocess.run([TOGGLE])   # rail 上任意键 → 展开
+                self.act(lambda: subprocess.run([TOGGLE]))   # rail 任意键 → 展开
                 self.draw(stdscr)
             elif ch in (curses.KEY_DOWN, ord("j")):
                 self.move(row_idx, 1)
@@ -614,6 +654,7 @@ class App:
                 self.move(row_idx, -1)
                 self.draw(stdscr)
             elif ch in (curses.KEY_ENTER, 10, 13):
+                self.focus_visible = False      # 回车后撤掉灰底,直到下次方向键
                 self.open_selected(items, row_idx)
                 self.draw(stdscr)
             elif ch == curses.KEY_MOUSE:
@@ -621,6 +662,7 @@ class App:
                     _, mx, my, _, bstate = curses.getmouse()
                     H = stdscr.getmaxyx()[0]
                     if bstate & curses.BUTTON1_CLICKED:
+                        self.last_motion = time.time()
                         self.click(my, mx, H, items, row_idx)
                         self.draw(stdscr)
                     elif bstate & curses.BUTTON4_PRESSED:
@@ -630,8 +672,43 @@ class App:
                         self.offset = min(max(0, len(items) - 1),
                                           self.offset + 3)
                         self.draw(stdscr)
+                    elif bstate & curses.REPORT_MOUSE_POSITION:
+                        # 鼠标悬停: 命中行/按钮变化时重画
+                        self.last_motion = time.time()
+                        new_hover = None
+                        if self.rail:
+                            new_hover = ("rail",)
+                        elif my in self.row_at:
+                            new_hover = ("row", self.row_at[my])
+                        elif my == H - 1:
+                            if mx >= self.footer_btn_x - 1:
+                                new_hover = ("collapse",)
+                            elif (self.exit_zone and
+                                  self.exit_zone[0] <= mx <= self.exit_zone[1]):
+                                new_hover = ("exit",)
+                        if new_hover != self.hover:
+                            self.hover = new_hover
+                            self.draw(stdscr)
                 except curses.error:
                     pass
+
+    def remember_width(self, stdscr):
+        """只在拖动分隔条(窗口宽不变、面板宽变)时记忆宽度;
+        窗口缩放引起的面板宽度变化一律不记, 避免记住畸形宽度。"""
+        if self.rail:
+            return
+        H, W = stdscr.getmaxyx()
+        if not (MIN_W_SAVE <= W <= MAX_W):
+            return
+        r = tmux("display-message", "-p", "-t", f"{SESSION}:0",
+                 "#{window_width}")
+        ww = r.stdout.strip() if r else ""
+        if ww != self.last_ww:
+            self.last_ww = ww        # 窗口尺寸变了 → 宽度变化不算拖动
+            return
+        if W != self.last_saved_w:
+            self.last_saved_w = W
+            save_expanded_width(W)
 
 
 def main():
