@@ -27,9 +27,8 @@ REFRESH_SECS = 15        # 数据刷新周期
 MAX_GROUPS = 12
 PER_GROUP = 6
 MIN_W_SAVE = 12          # 记忆展开宽度时的下限
-MAX_W = 35               # 记忆展开宽度的上限
-W_COOLDOWN = 3.0         # rail 兜底纠宽的最小间隔(秒)
-DEFEND_COOLDOWN = 1.0    # 窄窗自防(请 autofit 收 rail)的最小间隔(秒)
+MAX_W = 40               # 记忆/允许的展开宽度上限
+W_COOLDOWN = 0.6         # 布局守卫纠宽的最小间隔(秒)
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # 工作中: 动态菊花帧, 对齐 Claude Code
 
 ACCENT = 209             # 珊瑚 #d7875f(近 Anthropic D97757)
@@ -227,6 +226,11 @@ def expanded_width() -> int:
     return fallback
 
 
+def window_width() -> str:
+    r = tmux("display-message", "-p", "-t", f"{SESSION}:0", "#{window_width}")
+    return r.stdout.strip() if r else ""
+
+
 def live_status() -> dict:
     """{sessionId: status} — 来自 claude agents --json 的原始状态"""
     try:
@@ -248,19 +252,21 @@ def live_status() -> dict:
 
 
 def status_glyph(sid: str, live: dict) -> tuple:
-    """(字符或 None=菊花动画, 状态种类) — 对齐 Claude Code fleet view"""
+    """(字符或 None=菊花动画, 状态种类) — 对齐 Claude Code fleet view:
+    工作中=菊花(珊瑚) 等待输入=✱(黄) 完成/停止/历史=∙(灰)
+    右栏正在显示的会话=✽(珊瑚) 失败=✱(红)"""
     st = live.get(sid)
     if st is None:
-        return ("∙", "idle")                 # 历史(未运行)
+        return ("∙", "dim")                  # 历史(未运行)
     s = st.lower()
     if sid == current_session_id():
-        return (None, "accent")              # 右栏当前会话(菊花)
+        return ("✽", "accent")               # 右栏当前会话
     if "input" in s or "wait" in s:
         return ("✱", "yellow")               # 等待用户输入
     if s in ("busy", "working", "active", "running"):
         return (None, "accent")              # 工作中(菊花)
     if s in ("done", "completed"):
-        return ("∙", "green")                # 完成
+        return ("∙", "dim")                  # 完成
     if "fail" in s or "error" in s:
         return ("✱", "red")                  # 失败
     return ("∙", "dim")                      # 已停止/退出
@@ -328,12 +334,11 @@ class App:
         self.row_at = {}        # 屏幕行号 → display 行序号
         self.last_pane_check = 0.0
         self.last_fix = 0.0
-        self.last_defend = 0.0
-        self.last_w_check = 0.0
         self.last_act = 0.0     # 点击动作防抖
         self.last_motion = 0.0
         self.last_saved_w = 0
-        self.last_ww = None     # 上次见到的窗口宽度(区分拖分隔条/缩放窗口)
+        self.last_ww = None     # 上次见到的窗口宽度
+        self.ww_changed_at = 0.0  # 窗口宽度最后变化时刻(区分缩放/拖分隔条)
 
     def act(self, fn):
         """点击动作防抖: 180ms 内的重复事件忽略"""
@@ -463,22 +468,25 @@ class App:
                 if gch is None:   # 工作中 → 菊花当前帧
                     gch = SPINNER[int(now_ms / 120) % len(SPINNER)]
                 if cursor:
-                    a_title = curses.color_pair(
-                        15 if current else 13)
+                    a_title = curses.color_pair(13)
                     a_time = curses.color_pair(14)
                     a_glyph = curses.color_pair(CURSOR_BG.get(gkind, 14))
                 elif hovered:
-                    a_title = curses.color_pair(
-                        22 if current else 20)
+                    a_title = curses.color_pair(20)
                     a_time = curses.color_pair(21)
                     a_glyph = curses.color_pair(HOVER_BG.get(gkind, 21))
                 else:
-                    a_title = curses.color_pair(5 if current else 1)
+                    a_title = curses.color_pair(1)
                     a_time = curses.color_pair(3)
                     a_glyph = curses.color_pair(KIND_PAIR.get(gkind, 3))
-                if cursor:
-                    # 焦点行左侧珊瑚竖条(在灰底带内)
-                    stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
+                if current:
+                    # 珊瑚竖条 + 珊瑚标题 = 右栏正在显示的会话(不随键盘焦点移动)
+                    a_title = curses.color_pair(
+                        15 if cursor else (22 if hovered else 5))
+                    stdscr.addnstr(y, 1, "▌", 1,
+                                   curses.color_pair(
+                                       15 if cursor else (22 if hovered
+                                                          else 5)))
                 stdscr.addnstr(y, 2, title, W - 2, a_title)
                 x_time = W - 2 - cell_len(gch) - 1 - cell_len(t)
                 stdscr.addnstr(y, max(2, x_time), t, W - 2, a_time)
@@ -616,24 +624,8 @@ class App:
                 self.last_pane_check = now
                 if not self.right_pane_alive():
                     return
-            # rail 安全兜底: 只在窄于 RAIL_W 时纠回(绝不妨碍展开)
-            if self.rail and now - self.last_fix > W_COOLDOWN:
-                H, W = stdscr.getmaxyx()
-                if W < CFG["RAIL_W"]:
-                    self.last_fix = now
-                    p = sidebar_pane_id()
-                    if p:
-                        tmux("resize-pane", "-t", p, "-x", str(CFG["RAIL_W"]))
-            # 展开状态被挤压到阈值以下 → 立即请 autofit 收成 rail
-            if not self.rail and now - self.last_defend > DEFEND_COOLDOWN:
-                H, W = stdscr.getmaxyx()
-                if W < CFG["COLLAPSE_AT"]:
-                    self.last_defend = now
-                    subprocess.run([AUTOFIT], capture_output=True, timeout=8)
-            # 展开状态: 周期性记住当前宽度(仅分隔条拖动, 见 remember_width)
-            if not self.rail and now - self.last_w_check > 2:
-                self.last_w_check = now
-                self.remember_width(stdscr)
+            # 布局守卫: 面板宽度偏离目标 → 立即重申 main-vertical 布局
+            self.layout_guard(stdscr)
             # 悬停过期清理(鼠标离开侧栏后不再有 motion 事件)
             if self.hover and now - self.last_motion > 2.0:
                 self.hover = None
@@ -692,23 +684,56 @@ class App:
                 except curses.error:
                     pass
 
-    def remember_width(self, stdscr):
-        """只在拖动分隔条(窗口宽不变、面板宽变)时记忆宽度;
-        窗口缩放引起的面板宽度变化一律不记, 避免记住畸形宽度。"""
-        if self.rail:
+    def layout_guard(self, stdscr):
+        """布局守卫: 面板宽度偏离目标 → 立即重申 main-vertical 布局。
+
+        tmux 在窗口缩放时会按比例重排(把小面板压到最小宽度), 只有
+        select-layout 才会按 main-pane-width 恢复; 本守卫以 120ms 节拍
+        检查并纠正。窗口宽度不变而面板宽度变 = 用户在拖分隔条 → 记忆。"""
+        if not self.ready:
             return
         H, W = stdscr.getmaxyx()
-        if not (MIN_W_SAVE <= W <= MAX_W):
+        target = CFG["RAIL_W"] if self.rail else expanded_width()
+        if W == target:
             return
-        r = tmux("display-message", "-p", "-t", f"{SESSION}:0",
-                 "#{window_width}")
-        ww = r.stdout.strip() if r else ""
+        ww = window_width()
         if ww != self.last_ww:
-            self.last_ww = ww        # 窗口尺寸变了 → 宽度变化不算拖动
+            self.last_ww = ww
+            self.ww_changed_at = time.time()
+        now = time.time()
+        recent_resize = now - self.ww_changed_at < 1.5
+        in_range = MIN_W_SAVE <= W <= MAX_W
+        if self.rail:
+            # rail: 宽度必须恒定, 偏了就纠
+            if now - self.last_fix < W_COOLDOWN:
+                return
+            self.last_fix = now
+            tmux("set-window-option", "-t", f"{SESSION}:0",
+                 "main-pane-width", str(target))
+            tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
+            p = sidebar_pane_id()
+            cw = tmux("display-message", "-p", "-t", p, '#{pane_width}')
+            if cw and cw.stdout.strip() != str(target):
+                tmux("resize-pane", "-t", p, "-x", str(target))
             return
-        if W != self.last_saved_w:
-            self.last_saved_w = W
-            save_expanded_width(W)
+        if W < CFG["COLLAPSE_AT"]:
+            return                 # 阈值以下归 autofit 管(收 rail)
+        if in_range and not recent_resize:
+            # 窗口没动而宽度变了 = 用户在拖分隔条 → 记忆, 不纠正
+            if W != self.last_saved_w:
+                self.last_saved_w = W
+                save_expanded_width(W)
+            return
+        if now - self.last_fix < W_COOLDOWN:
+            return
+        self.last_fix = now
+        tmux("set-window-option", "-t", f"{SESSION}:0",
+             "main-pane-width", str(target))
+        tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
+        p = sidebar_pane_id()
+        cw = tmux("display-message", "-p", "-t", p, '#{pane_width}')
+        if cw and cw.stdout.strip() != str(target):
+            tmux("resize-pane", "-t", p, "-x", str(target))
 
 
 def main():

@@ -31,7 +31,7 @@ SIDEBAR_W=${SIDEBAR_W:-35}
 INIT_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
 case "$INIT_W" in ''|*[!0-9]*) INIT_W=$SIDEBAR_W ;; esac
 [ "$INIT_W" -ge 12 ] 2>/dev/null || INIT_W=$SIDEBAR_W
-[ "$INIT_W" -le 35 ] 2>/dev/null || INIT_W=35
+[ "$INIT_W" -le 40 ] 2>/dev/null || INIT_W=35
 
 # 先起侧栏(main-vertical 的主面板 = 最先创建的面板), 再向右切出宿主。
 # -x/-y 给出接近真实终端的初始尺寸, 避免 attach 时的二次重排闪变。

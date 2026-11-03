@@ -18,7 +18,7 @@ COLLAPSE_AT=${COLLAPSE_AT:-70}
 EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
 case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
 [ "$EXPAND_W" -ge 12 ] 2>/dev/null || EXPAND_W=$SIDEBAR_W
-[ "$EXPAND_W" -le 35 ] 2>/dev/null || EXPAND_W=35
+[ "$EXPAND_W" -le 40 ] 2>/dev/null || EXPAND_W=35
 
 HOST_PANE=$(cat "$STATE_DIR/host-pane" 2>/dev/null)
 [ -n "$HOST_PANE" ] || exit 0

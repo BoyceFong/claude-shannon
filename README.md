@@ -89,7 +89,7 @@ Every other `claude` usage passes through untouched.
 | `COLLAPSE_AT` | `70` | Window width below which the sidebar auto-collapses to the rail |
 | `RAIL_W` | `2` | Collapsed rail width |
 
-The expanded width you set by dragging the divider is remembered in `~/.claude/shannon/sidebar-w` (clamped to 12–35 columns) and survives restarts.
+The expanded width you set by dragging the divider is remembered in `~/.claude/shannon/sidebar-w` (clamped to 12–40 columns) and survives restarts.
 
 ## How it works
 
