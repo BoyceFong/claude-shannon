@@ -585,6 +585,7 @@ class App:
         curses.curs_set(0)
         stdscr.keypad(True)
         stdscr.timeout(120)
+        self.base_timeout = 120
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, -1, -1)
@@ -690,6 +691,62 @@ class App:
             tmux("resize-pane", "-t", p, "-x", str(target))
 
 
+    def handle_escape(self, stdscr, items, row_idx):
+        """解码 SGR 鼠标序列 \x1b[<b;x;yM/m (ncurses 不认, 需自制解析)。
+        b: 0=左键按下 1=左键抬起 64/65=滚轮 32=悬停移动"""
+        H, W = stdscr.getmaxyx()
+        stdscr.timeout(40)              # 序列剩余字节的最大等待
+        seq = [27]
+        try:
+            while len(seq) < 24:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                seq.append(c)
+                if (c in (77, 109) and len(seq) >= 6
+                        and seq[1] == 91 and seq[2] == 60):
+                    break               # M/m = 序列终结
+        finally:
+            stdscr.timeout(self.base_timeout)
+        if seq[1] != 91 or seq[2] != 60:
+            return                      # 其他 ESC 序列: 忽略
+        try:
+            parts = "".join(chr(c) for c in seq[3:-1]).split(";")
+            b, x, y = int(parts[0]), int(parts[1]), int(parts[2])
+        except (ValueError, IndexError):
+            return
+        mx, my = x - 1, y - 1           # SGR 坐标从 1 起
+        if b & 32 or b == 35:
+            # 悬停移动(无按键)
+            new_hover = None
+            if self.rail:
+                new_hover = ("rail",)
+            elif my in self.row_at:
+                new_hover = ("row", self.row_at[my])
+            elif my == H - 1:
+                if mx >= self.footer_btn_x - 1:
+                    new_hover = ("collapse",)
+                elif (self.exit_zone
+                      and self.exit_zone[0] <= mx <= self.exit_zone[1]):
+                    new_hover = ("exit",)
+            self.last_motion = time.time()
+            if new_hover != self.hover:
+                self.hover = new_hover
+                self.draw(stdscr)
+            return
+        if b in (64, 65):               # 滚轮
+            if b == 64:
+                self.offset = max(0, self.offset - 3)
+            else:
+                self.offset = min(max(0, len(items) - 1) if items else 0,
+                                  self.offset + 3)
+            self.draw(stdscr)
+            return
+        if b == 0:                      # 左键按下 → 点击
+            self.last_motion = time.time()
+            self.click(my, mx, H, items, row_idx)
+            self.draw(stdscr)
+
     def tick(self, stdscr):
         try:
             self._tick(stdscr)
@@ -737,7 +794,10 @@ class App:
             self.draw(stdscr)
 
         ch = stdscr.getch()
-        if ch == curses.KEY_RESIZE:
+        if ch == 27:
+            # SGR 鼠标序列(悬停/点击/滚轮)由我们自己解码 — 对齐 fleet view
+            self.handle_escape(stdscr, items, row_idx)
+        elif ch == curses.KEY_RESIZE:
             stdscr.erase()
             self.draw(stdscr)
             self.layout_guard(stdscr)
