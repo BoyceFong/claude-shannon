@@ -53,6 +53,7 @@ printf 'fleet\n' > "$STATE_DIR/current-session"
 # main-vertical + main-pane-width: 窗口变化时侧栏宽度由 tmux 保持恒定
 tmux set-window-option -t "$SESS:0" main-pane-width "$START_W"
 tmux select-layout -t "$SESS:0" main-vertical
+tmux set-window-option -t "$SESS:0" remain-on-exit on || true
 
 # 极简观感: 单条 dim 分隔线,无边框无标题 (选项失败不致命)
 tmux set-option -t "$SESS" mouse on || true
