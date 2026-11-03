@@ -282,11 +282,12 @@ def status_glyph(sid: str, live: dict) -> tuple:
 
 KIND_PAIR = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
              "dim": 3, "idle": 3}
-# 焦点行(灰底 236)与悬停行(灰底 234)的同色系变体
+# 焦点行(灰底 236)的同色系变体
 CURSOR_BG = {"accent": 15, "green": 16, "yellow": 17, "red": 18,
              "dim": 14, "idle": 14}
-HOVER_BG = {"accent": 22, "green": 23, "yellow": 24, "red": 25,
-            "dim": 21, "idle": 21}
+# 悬停: 对齐 fleet view —— 文字提亮, 不加底色
+HOVER_FG = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
+            "dim": 4, "idle": 4}
 
 
 # ---------------------------------------------------------------- 操作
@@ -421,7 +422,8 @@ class App:
             stdscr.erase()
             gx = max(0, min(1, W - 2))
             if self.hover == ("rail",):
-                stdscr.addnstr(H - 1, gx, "▶", 1, curses.color_pair(22))
+                stdscr.addnstr(H - 1, gx, "▶", 1, curses.color_pair(26)
+                               | curses.A_BOLD)
             else:
                 stdscr.addnstr(H - 1, gx, "▶", 1,
                                curses.color_pair(5) | curses.A_BOLD)
@@ -482,9 +484,10 @@ class App:
                     a_time = curses.color_pair(14)
                     a_glyph = curses.color_pair(CURSOR_BG.get(gkind, 14))
                 elif hovered:
-                    a_title = curses.color_pair(20)
-                    a_time = curses.color_pair(21)
-                    a_glyph = curses.color_pair(HOVER_BG.get(gkind, 21))
+                    a_title = curses.color_pair(26)   # 悬停: 文字提亮
+                    a_time = curses.color_pair(4)
+                    a_glyph = curses.color_pair(
+                        HOVER_FG.get(gkind, 4))
                 else:
                     a_title = curses.color_pair(1)
                     a_time = curses.color_pair(3)
@@ -516,14 +519,14 @@ class App:
         self.footer_btn_x = max(1, W - 1 - cell_len(btn))
         self.exit_zone = (1, cell_len(left))
         if self.hover == ("exit",):
-            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(20))
+            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(26))
         else:
             stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(3))
         if self.hover == ("collapse",):
             stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
-                           curses.color_pair(22))
+                           curses.color_pair(5) | curses.A_BOLD)
             stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
-                           W - self.footer_btn_x - 1, curses.color_pair(20))
+                           W - self.footer_btn_x - 1, curses.color_pair(26))
         else:
             stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
                            curses.color_pair(5))
@@ -603,12 +606,7 @@ class App:
         curses.init_pair(16, GREEN, 236)
         curses.init_pair(17, YELLOW, 236)
         curses.init_pair(18, RED, 236)
-        curses.init_pair(20, -1, 234)    # 悬停行: 标题
-        curses.init_pair(21, 240, 234)   # 悬停行: 时间/暗色
-        curses.init_pair(22, ACCENT, 234)
-        curses.init_pair(23, GREEN, 234)
-        curses.init_pair(24, YELLOW, 234)
-        curses.init_pair(25, RED, 234)
+        curses.init_pair(26, 255, -1)    # 悬停行: 文字提亮
         try:
             curses.mouseinterval(0)   # 点击改用 PRESSED 上报, motion 即时生效
         except curses.error:
@@ -639,17 +637,28 @@ class App:
                 log("tick 异常:\n" + traceback.format_exc())
                 raise
 
-    def layout_guard(self, stdscr):
-        """布局守卫: 面板宽度偏离目标 → 立即重申 main-vertical 布局。
+    def main_pane_width(self) -> int:
+        """tmux 里的 main-pane-width 选项值(布局的唯一事实源)"""
+        r = tmux("show-window-option", "-v", "-t", f"{SESSION}:0",
+                 "main-pane-width")
+        try:
+            return int(r.stdout.strip())
+        except (ValueError, AttributeError, TypeError):
+            return expanded_width()
 
-        tmux 在窗口缩放时会按比例重排(把小面板压到最小宽度), 只有
-        select-layout 才会按 main-pane-width 恢复; 本守卫以 120ms 节拍
-        检查并纠正。窗口宽度不变而面板宽度变 = 用户在拖分隔条 → 记忆。"""
+    def layout_guard(self, stdscr):
+        """布局守卫: main-pane-width 选项是唯一事实源。
+
+        面板宽度 == 选项值 → 一切正常;
+        面板宽度 != 选项值 →
+          窗口正在缩放 → 交给 autofit/阈值逻辑, 不插手;
+          窗口没动且宽度在 [12,40] → 用户在拖分隔条 → 采纳为新宽度;
+          否则(被挤压/越界) → 重申布局纠正回选项值。"""
         if not self.ready:
             return
         H, W = stdscr.getmaxyx()
-        target = CFG["RAIL_W"] if self.rail else expanded_width()
-        if W == target:
+        opt = self.main_pane_width()
+        if W == opt:
             return
         ww = window_width()
         if ww != self.last_ww:
@@ -657,24 +666,12 @@ class App:
             self.ww_changed_at = time.time()
         now = time.time()
         recent_resize = now - self.ww_changed_at < 1.5
-        in_range = MIN_W_SAVE <= W <= MAX_W
-        if self.rail:
-            # rail: 宽度必须恒定, 偏了就纠
-            if now - self.last_fix < W_COOLDOWN:
-                return
-            self.last_fix = now
+        if recent_resize:
+            return                 # 缩放中的偏差归 autofit/阈值逻辑管
+        if not self.rail and 12 <= W <= MAX_W:
+            # 窗口没动而宽度变了 = 用户在拖分隔条 → 采纳并记忆
             tmux("set-window-option", "-t", f"{SESSION}:0",
-                 "main-pane-width", str(target))
-            tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
-            p = sidebar_pane_id()
-            cw = tmux("display-message", "-p", "-t", p, '#{pane_width}')
-            if cw and cw.stdout.strip() != str(target):
-                tmux("resize-pane", "-t", p, "-x", str(target))
-            return
-        if W < CFG["COLLAPSE_AT"]:
-            return                 # 阈值以下归 autofit 管(收 rail)
-        if in_range and not recent_resize:
-            # 窗口没动而宽度变了 = 用户在拖分隔条 → 记忆, 不纠正
+                 "main-pane-width", str(W))
             if W != self.last_saved_w:
                 self.last_saved_w = W
                 save_expanded_width(W)
@@ -683,12 +680,12 @@ class App:
             return
         self.last_fix = now
         tmux("set-window-option", "-t", f"{SESSION}:0",
-             "main-pane-width", str(target))
+             "main-pane-width", str(opt))
         tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
         p = sidebar_pane_id()
         cw = tmux("display-message", "-p", "-t", p, '#{pane_width}')
-        if cw and cw.stdout.strip() != str(target):
-            tmux("resize-pane", "-t", p, "-x", str(target))
+        if cw and cw.stdout.strip() != str(opt):
+            tmux("resize-pane", "-t", p, "-x", str(opt))
 
 
     def handle_escape(self, stdscr, items, row_idx):

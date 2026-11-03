@@ -35,12 +35,7 @@ case "$INIT_W" in ''|*[!0-9]*) INIT_W=$SIDEBAR_W ;; esac
 
 # 先起侧栏(main-vertical 的主面板 = 最先创建的面板), 再向右切出宿主。
 # -x/-y 给出接近真实终端的初始尺寸, 避免 attach 时的二次重排闪变。
-MODE0=$(cat "$STATE_DIR/mode" 2>/dev/null || true)
-if [ "$MODE0" = "manual" ]; then
-  START_W=$RAIL_W          # 上次退出时是手动折叠状态 → 保持折叠
-else
-  START_W=$INIT_W
-fi
+# 启动永远展开到记忆宽度(折叠只是会话内临时状态), mode 归零。
 SIDEBAR_PANE=$(tmux new-session -d -s "$SESS" -c "$HOME" -x 220 -y 40 \
   -P -F '#{pane_id}' "$BIN_DIR/shannon-sidebar")
 HOST_PANE=$(tmux split-window -h -t "$SIDEBAR_PANE" -c "$DIR" -P -F '#{pane_id}' \
@@ -48,7 +43,7 @@ HOST_PANE=$(tmux split-window -h -t "$SIDEBAR_PANE" -c "$DIR" -P -F '#{pane_id}'
 printf '%s\n' "$HOST_PANE" > "$STATE_DIR/host-pane"
 printf '%s\n' "$SIDEBAR_PANE" > "$STATE_DIR/sidebar-pane"
 printf 'fleet\n' > "$STATE_DIR/current-session"
-[ -f "$STATE_DIR/mode" ] || printf '%s\n' auto > "$STATE_DIR/mode"
+printf '%s\n' auto > "$STATE_DIR/mode"
 
 # main-vertical + main-pane-width: 窗口变化时侧栏宽度由 tmux 保持恒定
 tmux set-window-option -t "$SESS:0" main-pane-width "$START_W"
