@@ -15,9 +15,11 @@ import sys
 import threading
 import time
 import unicodedata
+from datetime import datetime
 
 HOME = os.path.expanduser("~")
 PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
+JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
 STATE_DIR = os.path.join(HOME, ".claude", "shannon")
 SESSION = os.environ.get("SHANNON_SESSION", "shannon")
 TOGGLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shannon-toggle")
@@ -44,9 +46,10 @@ W_COOLDOWN = 0.6         # 布局守卫纠宽的最小间隔(秒)
 SPINNER = "·✢✳✶✻✽"       # 工作中: 星形旋转帧, 逐帧对齐 Claude Code
 
 ACCENT = 209             # 珊瑚 #d7875f(近 Anthropic D97757)
-GREEN = 114
-YELLOW = 214
+GREEN = 114              # fleet view: Done
+YELLOW = 220             # fleet view: Needs input
 RED = 167
+GRAY = 246               # fleet view: Working / Stopped / 次级文字
 
 
 def load_config() -> dict:
@@ -266,6 +269,64 @@ def scan_segments() -> list:
     return segs
 
 
+def parse_ts(value) -> float:
+    """Claude 的 ISO 时间戳(带 Z) → epoch 毫秒; 解析失败返回 0。"""
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")).timestamp() * 1000
+    except ValueError:
+        return 0.0
+
+
+def scan_jobs() -> list:
+    """~/.claude/jobs/*/state.json = fleet view 的会话注册表。
+
+    fleet view 的分组/排序/glyph 都由这里的事实决定:
+      组顺序   = 组内最新 updatedAt 降序
+      组内顺序 = createdAt 升序
+      glyph    = tempo/state (active / blocked / done / stopped)
+    """
+    try:
+        entries = list(os.scandir(JOBS_DIR))
+    except OSError:
+        return []
+    jobs = []
+    for d in entries:
+        try:
+            with open(os.path.join(d.path, "state.json")) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(st, dict):
+            continue
+        sid = str(st.get("sessionId") or "")
+        rid = str(st.get("resumeSessionId") or sid)
+        if not sid and not rid:
+            continue
+        try:
+            mtime = d.stat().st_mtime * 1000
+        except OSError:
+            mtime = 0.0
+        name = str(st.get("name") or st.get("displayIntent")
+                   or st.get("intent") or "").strip()
+        jobs.append({
+            "short": str(st.get("daemonShort") or os.path.basename(d.path)),
+            "session_id": sid,
+            "resume_id": rid or sid,
+            "cwd": str(st.get("cwd") or st.get("originCwd") or ""),
+            "name": clean_title(name) if name else "",
+            "state": str(st.get("state") or "").lower(),
+            "tempo": str(st.get("tempo") or "").lower(),
+            "needs": bool(st.get("needs")),
+            "created": parse_ts(st.get("createdAt")) or mtime,
+            "updated": parse_ts(st.get("updatedAt")) or mtime,
+            "has_output": st.get("output") is not None,
+        })
+    return jobs
+
+
 def live_rank(info: dict) -> int:
     """活着的 worker 有多值得作为会话代表: 工作中 > 等输入 > 空闲/完成。"""
     status = str(info.get("status") or "").lower()
@@ -306,9 +367,17 @@ def pick_title(members: list) -> str:
     return "Untitled"
 
 
-def order_key(row: dict) -> str:
-    """排序身份的锚点: 同一会话的代表分段变了, 排序位置也不跳。"""
-    return f"root:{row['root']}" if row.get("root") else row["id"]
+def _base_title(title: str) -> str:
+    """去掉 fleet 为重名加的 " (2)" 后缀, 用于跨数据源匹配。"""
+    match = COLLISION_RE.match(title or "")
+    return match.group("base") if match else (title or "")
+
+
+def _group_name(row: dict) -> str:
+    cwd = row.get("cwd") or ""
+    if cwd:
+        return os.path.basename(cwd.rstrip("/")) or row.get("project") or cwd
+    return row.get("project") or "?"
 
 
 def build_conversations(segments: list, live: dict, ignored: set) -> list:
@@ -385,6 +454,113 @@ def build_conversations(segments: list, live: dict, ignored: set) -> list:
             "has_messages": any(s["has_messages"] for s in members),
         })
     return convs
+
+
+def build_rows(segments: list, jobs: list, live: dict, ignored: set) -> list:
+    """fleet 行 + 历史行, 顺序与右栏 fleet view 完全一致。
+
+    fleet 行直接来自 job 注册表(一行一个 job, 标题用注册表的 name);
+    transcript 折叠出的会话只在没有对应 job 时作为历史行, 补在组内
+    fleet 行之后。分组顺序 = 组内最新 updatedAt 降序; 组内 fleet 行
+    = createdAt 升序。历史会话不会插到 fleet 行之间。"""
+    convs = build_conversations(segments, live, ignored)
+    conv_by_member = {}
+    by_title = {}
+    for c in convs:
+        for member in c["ids"]:
+            conv_by_member[member] = c
+        if c["cwd"]:
+            by_title[(c["cwd"], _base_title(c["title"]))] = c
+
+    fleet_rows = []
+    represented = set()
+    fleet_titles = set()
+    for job in jobs:
+        conv = (conv_by_member.get(job["resume_id"])
+                or conv_by_member.get(job["session_id"])
+                or by_title.get((job["cwd"], _base_title(job["name"]))))
+        ids = {job["session_id"], job["resume_id"]}
+        root = ""
+        if conv:
+            ids.update(conv["ids"])
+            root = conv["root"]
+        if any(i in ignored for i in ids):
+            continue
+        if root and f"root:{root}" in ignored:
+            continue
+        if conv:
+            represented.add(id(conv))
+        live_info = live.get(job["session_id"])
+        title = job["name"] or (conv["title"] if conv else "Untitled")
+        fleet_titles.add((job["cwd"], _base_title(title)))
+        fleet_rows.append({
+            "kind": "fleet",
+            "id": job["resume_id"] or job["session_id"],
+            "live_id": job["session_id"] if live_info else "",
+            "ids": sorted(ids),
+            "root": root,
+            "cwd": job["cwd"] or (conv["cwd"] if conv else ""),
+            "project": conv["project"] if conv else "",
+            "title": title,
+            "state": job["state"],
+            "tempo": job["tempo"],
+            "needs": job["needs"],
+            "has_output": job["has_output"],
+            "created": job["created"],
+            "updated": job["updated"],
+            "mtime": conv["mtime"] if conv else job["updated"],
+            "has_messages": True,
+        })
+
+    history = []
+    for c in convs:
+        if id(c) in represented:
+            continue
+        if c["cwd"] and (c["cwd"], _base_title(c["title"])) in fleet_titles:
+            continue
+        history.append(c)
+
+    groups = {}
+
+    def group(key):
+        if key not in groups:
+            groups[key] = {"fleet": [], "history": [],
+                           "fleet_sort": 0.0, "history_sort": 0.0}
+        return groups[key]
+
+    for row in fleet_rows:
+        key = row["cwd"] or row["project"] or "?"
+        g = group(key)
+        g["fleet"].append(row)
+        g["fleet_sort"] = max(g["fleet_sort"], row["updated"])
+    for c in history:
+        key = c["cwd"] or c["project"] or "?"
+        g = group(key)
+        g["history"].append(c)
+        g["history_sort"] = max(g["history_sort"], c["mtime"])
+
+    fleet_groups = sorted((g for g in groups.values() if g["fleet"]),
+                          key=lambda g: g["fleet_sort"], reverse=True)
+    history_groups = sorted((g for g in groups.values() if g["history"]),
+                            key=lambda g: g["history_sort"], reverse=True)
+    ordered = []
+    # fleet 区块: 与右栏逐行对齐, 中间不插历史行
+    for g in fleet_groups:
+        g["fleet"].sort(key=lambda r: r["created"])
+        for row in g["fleet"]:
+            row["_group"] = row["cwd"] or row["project"] or "?"
+            row["_gname"] = _group_name(row)
+            row["_section"] = "fleet"
+            ordered.append(row)
+    # 历史区块: 全部排在 fleet 区块之后
+    for g in history_groups:
+        g["history"].sort(key=lambda c: c["mtime"], reverse=True)
+        for c in g["history"]:
+            c["_group"] = c["cwd"] or c["project"] or "?"
+            c["_gname"] = _group_name(c)
+            c["_section"] = "history"
+            ordered.append(c)
+    return ordered
 
 
 def host_pane_id() -> str:
@@ -504,7 +680,9 @@ def live_status() -> dict:
             continue
         # pid=null: agents 仍会列出这个后台会话(等待输入/已完成), 状态照常
         # 展示, 但它没有可接管的 job —— `claude attach` 会报 No job matching。
-        attachable = bool(a.get("id")) and pid not in (None, "", 0)
+        attachable = (bool(a.get("id"))
+                      and pid not in (None, "", 0)
+                      and kind != "interactive")
         live[sid] = {"status": str(a.get("status") or ""),
                      "kind": kind,
                      "state": str(a.get("state") or ""),
@@ -515,38 +693,50 @@ def live_status() -> dict:
     return live
 
 
-def status_glyph(row: dict, live: dict, current: bool) -> tuple:
-    """(字符或 None=星形动画, 状态种类) — 逐项对齐 Claude Code fleet view:
-    工作中=星形旋转(珊瑚) 等待输入=✱(黄) 完成/停止/历史=•(灰)
-    右栏正在显示的会话=✽(珊瑚) 失败=✱(红)
+def fleet_status(row: dict, live: dict) -> str:
+    """fleet view 的状态语义(顺序很重要)。
 
-    状态取自会话的代表 worker; 一个会话有多个 fork 时, 只要有活着的
-    worker, 就用活得最"热"的那个的状态。"""
-    if current:
-        return ("✽", "accent")               # 右栏当前会话
-    if row.get("starting"):
-        return (None, "accent")              # 新建会话启动中
+    tempo=blocked 的 job 即使 state 还是 working, fleet 也显示 Needs input;
+    tempo=active 才是 Working; 其余按 done/stopped。"""
+    tempo = str(row.get("tempo") or "").lower()
+    state = str(row.get("state") or "").lower()
     info = live.get(row.get("live_id") or "")
     if info is None:
         for sid in row.get("ids", ()):        # live_id 刚失效时在族内兜底
             if sid in live:
                 info = live[sid]
                 break
-    if info is None:
-        return ("•", "dim")                  # 历史(未运行)
-    status = (info.get("status") or "").lower()
-    state = (info.get("state") or "").lower()
-    if ("input" in status or "wait" in status
-            or state in ("blocked", "waiting", "needs_input")):
-        return ("✱", "yellow")               # 等待用户输入
-    if (status in ("busy", "working", "active", "running")
-            or state in ("working", "running")):
-        return (None, "accent")              # 工作中(星形动画)
-    if state in ("done", "completed") or status in ("done", "completed"):
-        return ("•", "dim")                  # 完成
-    if "fail" in status or "error" in status or state in ("failed", "error"):
-        return ("✱", "red")                  # 失败
-    return ("•", "dim")                      # 已停止/退出
+    if info:
+        live_state = str(info.get("state") or "").lower()
+        if live_state:
+            state = live_state
+        if str(info.get("status") or "").lower() in (
+                "busy", "working", "active", "running"):
+            tempo = "active"
+    if tempo == "blocked" or state == "blocked" or row.get("needs"):
+        return "needs"
+    if tempo == "active" or state in ("working", "running"):
+        return "working"
+    if state in ("done", "completed"):
+        return "done"
+    if state in ("stopped", "failed", "error"):
+        return "stopped"
+    return "history"
+
+
+def status_glyph(row: dict, live: dict) -> tuple:
+    """(字符或 None=星形动画, 状态种类) — 逐字符对齐 fleet view:
+    工作中=灰星动画(246), 等输入=黄✻(220), 完成=绿∙(114), 停止/历史=灰∙(246)"""
+    if row.get("starting"):
+        return (None, "dim")
+    kind = fleet_status(row, live)
+    if kind == "working":
+        return (None, "dim")
+    if kind == "needs":
+        return ("✻", "yellow")
+    if kind == "done":
+        return ("∙", "green")
+    return ("∙", "dim")
 
 
 KIND_PAIR = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
@@ -584,27 +774,28 @@ def activate(row):
         return "已经在这里了"
     bin_dir = os.path.dirname(os.path.abspath(__file__))
     live = live_status()
-    # 族里所有活着的 worker, 最热的优先
+    # 行里所有活着的 worker; 可 attach 的优先, 同档再比"热"度
     live_ids = [sid for sid in row.get("ids", ()) if sid in live]
-    live_ids.sort(key=lambda sid: live_rank(live[sid]), reverse=True)
+    live_ids.sort(key=lambda sid: (bool(live[sid].get("attachable")),
+                                   live_rank(live[sid])), reverse=True)
     name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
-    if live_ids:
-        target = live_ids[0]
-        info = live[target]
-        if info.get("kind") == "interactive":
-            return "该会话正在其他终端运行"
+    for sid in live_ids:
+        info = live[sid]
         short = info.get("short") if info.get("attachable") else ""
-        if short:
-            # attach 用短 id(完整 uuid 匹配不到 job); 同时带上完整 id,
-            # 万一接管失败, shannon-host 会退回 --resume 同一会话。
-            r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
-                     "env", f"SHANNON_DIR={row['cwd']}",
-                     f"SHANNON_ATTACH={short}",
-                     f"SHANNON_RESUME={target}", f"{bin_dir}/shannon-host")
-            if r is not None and r.returncode == 0:
-                set_current_session(target)
-                return f"已接管后台会话: {name}"
-            return "接管失败"
+        if not short:
+            continue
+        # attach 用短 id(完整 uuid 匹配不到 job); 同时带上会话 id,
+        # 万一接管失败, shannon-host 会退回 --resume 同一会话。
+        r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
+                 "env", f"SHANNON_DIR={row['cwd']}",
+                 f"SHANNON_ATTACH={short}",
+                 f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
+        if r is not None and r.returncode == 0:
+            set_current_session(sid)
+            return f"已接管后台会话: {name}"
+        return "接管失败"
+    if any(live[sid].get("kind") == "interactive" for sid in live_ids):
+        return "该会话正在其他终端运行"
     r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
              "env", f"SHANNON_DIR={row['cwd']}",
              f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
@@ -624,7 +815,6 @@ class App:
         self.ready = False
         self.version = 0
         self.stop = threading.Event()
-        self.order = None            # 首次加载时冻结的排序基准(id → mtime)
         self.ghost = None            # 刚新建、transcript 尚未落盘的占位会话
         self.wake = threading.Event()
         threading.Thread(target=self.refresh_loop, daemon=True).start()
@@ -671,8 +861,9 @@ class App:
     def refresh_loop(self):
         while not self.stop.is_set():
             segments = scan_segments()
+            jobs = scan_jobs()
             live = live_status()
-            rows = build_conversations(segments, live, load_ignored())
+            rows = build_rows(segments, jobs, live, load_ignored())
             ghost = self.ghost
             if ghost:
                 # 新会话的 transcript 落盘后, 占位行功成身退
@@ -682,16 +873,21 @@ class App:
                 if real or time.time() > (ghost["mtime"] + 300000) / 1000:
                     self.ghost = None
                 else:
-                    rows = [dict(ghost)] + [
-                        r for r in rows if r["cwd"] != ghost["cwd"]]
-            with self.lock:
-                if self.order is None:
-                    # 冻结初始排序: 之后点击/加载不再扰动顺序
-                    self.order = {order_key(r): r["mtime"] for r in rows}
-                order = dict(self.order)
-            for r in rows:
-                r["_k"] = order.get(order_key(r), r["mtime"])
-            rows.sort(key=lambda r: r["_k"], reverse=True)
+                    # 插进它所属项目组的末尾(不打断 fleet 的组顺序);
+                    # 全新项目则放在 fleet 区块末尾。
+                    key = ghost.get("_group") or ghost["cwd"]
+                    insert_at = None
+                    for i, r in enumerate(rows):
+                        if (r.get("_section") or "fleet") != "fleet":
+                            break
+                        if (r.get("_group") or r.get("cwd")) == key:
+                            insert_at = i + 1
+                    if insert_at is None:
+                        insert_at = next(
+                            (i for i, r in enumerate(rows)
+                             if (r.get("_section") or "fleet") != "fleet"),
+                            len(rows))
+                    rows.insert(insert_at, dict(ghost))
             with self.lock:
                 self.rows = rows
                 self.live = live
@@ -706,24 +902,37 @@ class App:
 
     # -- 展示模型 -----------------------------------------------------
     def display_items(self, rows):
-        """[('group', name) | ('row', row)] — 分组、限量(顺序沿用 rows)
+        """[('group', name) | ('row', row)] — 顺序完全沿用 rows。
 
-        分组身份用完整 cwd, 显示名才用 basename: ~/work/app 和
-        ~/personal/app 是两个项目, 不能因为同名就合并。"""
-        groups = {}
-        for r in rows:
-            key = r["cwd"] or r["project"]
-            name = (os.path.basename(r["cwd"].rstrip("/")) or r["project"]
-                    if r["cwd"] else r["project"])
-            groups.setdefault(key, {"name": name, "rows": []})["rows"].append(r)
+        rows 已由 build_rows 按 fleet view 的组顺序/组内顺序排好;
+        这里只负责插入项目标题、按组限量, 不再重新排序。"""
         items = []
-        gs = sorted(groups.values(),
-                    key=lambda g: max(x["_k"] for x in g["rows"]),
-                    reverse=True)
-        for g in gs[:MAX_GROUPS]:
-            items.append(("group", g["name"]))
-            for r in g["rows"][:PER_GROUP]:
-                items.append(("row", r))
+        current = None
+        section = None
+        history_marker = False
+        has_fleet = any((r.get("_section") or "fleet") == "fleet" for r in rows)
+        groups = 0
+        count = 0
+        for r in rows:
+            key = r.get("_group") or r.get("cwd") or r.get("project")
+            this_section = r.get("_section") or "fleet"
+            if this_section != section:
+                section = this_section
+                current = None          # 强制为新 section 出组标题
+            if key != current:
+                if groups >= MAX_GROUPS:
+                    break
+                if section == "history" and has_fleet and not history_marker:
+                    items.append(("group", "HISTORY"))
+                    history_marker = True
+                current = key
+                groups += 1
+                count = 0
+                items.append(("group", r.get("_gname") or key))
+            if count >= PER_GROUP:
+                continue
+            count += 1
+            items.append(("row", r))
         return items
 
     # -- 绘制 ---------------------------------------------------------
@@ -797,8 +1006,11 @@ class App:
                 hovered = self.hover == ("row", i)
                 current = bool(cur) and cur in row.get("ids", (row["id"],))
                 t = ago(row["mtime"], now_ms)
-                gch, gkind = status_glyph(row, live, current)
-                room = max(6, W - cell_len(t) - 6)
+                gch, gkind = status_glyph(row, live)
+                # 与 fleet view 同构: [竖条] 状态logo 标题 …… 时间
+                x_glyph, x_title = 1, 3
+                x_time = max(x_title, W - 2 - cell_len(t))
+                room = max(4, x_time - x_title - 1)
                 title = trunc(row["title"], room)
                 if gch is None:   # 工作中 → 菊花当前帧
                     gch = SPINNER[int(now_ms / 120) % len(SPINNER)]
@@ -819,14 +1031,13 @@ class App:
                     # 珊瑚竖条 + 珊瑚标题 = 右栏正在显示的会话(不随键盘焦点移动)
                     a_title = curses.color_pair(
                         15 if cursor else (22 if hovered else 5))
-                    stdscr.addnstr(y, 1, "▌", 1,
+                    stdscr.addnstr(y, 0, "▌", 1,
                                    curses.color_pair(
                                        15 if cursor else (22 if hovered
                                                           else 5)))
-                stdscr.addnstr(y, 2, title, W - 2, a_title)
-                x_time = W - 2 - cell_len(gch) - 1 - cell_len(t)
-                stdscr.addnstr(y, max(2, x_time), t, W - 2, a_time)
-                stdscr.addnstr(y, W - 2, gch, 1, a_glyph)
+                stdscr.addnstr(y, x_glyph, gch, 1, a_glyph)
+                stdscr.addnstr(y, x_title, title, W - x_title, a_title)
+                stdscr.addnstr(y, x_time, t, W - 2, a_time)
                 self.row_at[y] = i
             y += 1
 
@@ -921,8 +1132,8 @@ class App:
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, -1, -1)
-        curses.init_pair(2, 243, -1)
-        curses.init_pair(3, 240, -1)
+        curses.init_pair(2, GRAY, -1)    # 项目标题(对齐 fleet 的 246 灰)
+        curses.init_pair(3, GRAY, -1)    # 时间/次级文字/灰状态点
         curses.init_pair(4, 250, -1)
         curses.init_pair(5, ACCENT, -1)
         curses.init_pair(8, GREEN, -1)
@@ -1266,6 +1477,8 @@ class App:
                 "mtime": time.time() * 1000,
                 "has_messages": True,
                 "starting": True,
+                "_group": cwd,
+                "_gname": name,
             }
             self.wake.set()          # 立即刷新, 新会话马上出现在列表里
             return f"新会话已创建: {name}"
@@ -1299,10 +1512,8 @@ class App:
         now = time.time()
         now_ms = now * 1000
         minute = int(now // 60)
-        working = any(isinstance(v, dict)
-                      and (v.get("status") or "").lower()
-                      in ("busy", "working", "active", "running")
-                      for v in live.values())
+        working = any(row.get("starting") or fleet_status(row, live) == "working"
+                      for row in rows)
         frame = int(now_ms / 120) % len(SPINNER)
         if (version != self.last_version or minute != self.last_minute
                 or (working and frame != self.last_frame)):
@@ -1400,17 +1611,19 @@ class App:
 
 
 def dump():
-    """调试视图: 打印折叠后的会话(不启动 curses)。"""
+    """调试视图: 按 fleet view 顺序打印行(不启动 curses)。"""
     segments = scan_segments()
+    jobs = scan_jobs()
     live = live_status()
-    rows = build_conversations(segments, live, load_ignored())
-    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    rows = build_rows(segments, jobs, live, load_ignored())
     now_ms = time.time() * 1000
     for r in rows:
-        print(f'{r["id"][:8]} {ago(r["mtime"], now_ms):>4} '
-              f'live={r["live_id"][:8] or "-":8} ids={len(r["ids"])} '
-              f'cwd={r["cwd"] or "-"} | {r["title"]}')
-    print(f"-- {len(segments)} segments -> {len(rows)} conversations")
+        kind = r.get("kind") or "history"
+        status = r.get("starting") and "starting" or fleet_status(r, live)
+        print(f'{r["_gname"]:<24} {kind:<7} {status:<8} '
+              f'{ago(r["mtime"], now_ms):>4} live={r["live_id"][:8] or "-":8} '
+              f'| {r["title"]}')
+    print(f"-- {len(segments)} segments, {len(jobs)} jobs -> {len(rows)} rows")
 
 
 def main():
