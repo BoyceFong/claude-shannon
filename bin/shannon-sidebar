@@ -498,12 +498,20 @@ def live_status() -> dict:
         sid = a.get("sessionId") or a.get("id")
         if not sid:
             continue
-        if "pid" in a and not pid_alive(a.get("pid")):
+        kind = str(a.get("kind") or "")
+        pid = a.get("pid")
+        if pid not in (None, "", 0) and not pid_alive(pid):
             continue
+        # pid=null: agents 仍会列出这个后台会话(等待输入/已完成), 状态照常
+        # 展示, 但它没有可接管的 job —— `claude attach` 会报 No job matching。
+        attachable = bool(a.get("id")) and pid not in (None, "", 0)
         live[sid] = {"status": str(a.get("status") or ""),
-                     "kind": str(a.get("kind") or ""),
+                     "kind": kind,
                      "state": str(a.get("state") or ""),
-                     "pid": a.get("pid")}
+                     "pid": pid,
+                     # `claude attach` 只认 8 位短 id(或会话名), 不认完整 uuid
+                     "short": str(a.get("id") or ""),
+                     "attachable": attachable}
     return live
 
 
@@ -582,15 +590,21 @@ def activate(row):
     name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
     if live_ids:
         target = live_ids[0]
-        if live[target].get("kind") == "interactive":
+        info = live[target]
+        if info.get("kind") == "interactive":
             return "该会话正在其他终端运行"
-        r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
-                 "env", f"SHANNON_DIR={row['cwd']}",
-                 f"SHANNON_ATTACH={target}", f"{bin_dir}/shannon-host")
-        if r is not None and r.returncode == 0:
-            set_current_session(target)
-            return f"已接管后台会话: {name}"
-        return "接管失败"
+        short = info.get("short") if info.get("attachable") else ""
+        if short:
+            # attach 用短 id(完整 uuid 匹配不到 job); 同时带上完整 id,
+            # 万一接管失败, shannon-host 会退回 --resume 同一会话。
+            r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
+                     "env", f"SHANNON_DIR={row['cwd']}",
+                     f"SHANNON_ATTACH={short}",
+                     f"SHANNON_RESUME={target}", f"{bin_dir}/shannon-host")
+            if r is not None and r.returncode == 0:
+                set_current_session(target)
+                return f"已接管后台会话: {name}"
+            return "接管失败"
     r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
              "env", f"SHANNON_DIR={row['cwd']}",
              f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")

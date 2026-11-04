@@ -12,19 +12,33 @@ cd "${SHANNON_DIR:-$HOME}" || cd "$HOME"
 trap '' INT
 
 while :; do
+  code=0
   if [ -n "${SHANNON_ATTACH:-}" ]; then
+    started=$(date +%s)
     "$CLAUDE_BIN" attach "$SHANNON_ATTACH"
+    code=$?
+    elapsed=$(( $(date +%s) - started ))
+    # 目标已不可接管(No job matching / worker 已结束): 快速失败时退回
+    # --resume 同一会话(复用原 session id, 不 fork), 而不是卡在错误页。
+    if [ "$code" -ne 0 ] && [ "$elapsed" -le 3 ] && [ -n "${SHANNON_RESUME:-}" ]; then
+      printf '\n· 接管失败, 改为恢复同一会话…\n'
+      SHANNON_ATTACH=
+      "$CLAUDE_BIN" --resume "$SHANNON_RESUME"
+      code=$?
+    fi
   elif [ -n "${SHANNON_RESUME:-}" ]; then
     "$CLAUDE_BIN" --resume "$SHANNON_RESUME"
+    code=$?
   elif [ "${SHANNON_START:-fleet}" = "fleet" ]; then
     "$CLAUDE_BIN" agents
+    code=$?
   else
     "$CLAUDE_BIN"
+    code=$?
   fi
-  code=$?
-  printf '%s claude exit=%s start=%s resume=%s\n' \
+  printf '%s claude exit=%s start=%s attach=%s resume=%s\n' \
     "$(date '+%H:%M:%S')" "$code" "${SHANNON_START:-fleet}" \
-    "${SHANNON_RESUME:--}" >> "$STATE_DIR/host.log" 2>/dev/null
+    "${SHANNON_ATTACH:--}" "${SHANNON_RESUME:--}" >> "$STATE_DIR/host.log" 2>/dev/null
   printf '\n· claude 已退出 (code %s) — 回车重启 · 输入 q 回车收工\n' "$code"
   read -r k || exit 0     # stdin 关闭(面板被销毁)→ 收工
   [ "$k" = q ] && break
