@@ -366,6 +366,7 @@ class App:
         self.footer_btn_x = -1
         self.exit_zone = None   # ✕ 退出 的点击范围
         self.new_zone = None    # ＋ 新建 的点击范围
+        self.cancel_zone = None  # 取消 的点击范围(picking)
         self.row_at = {}        # 屏幕行号 → display 行序号
         self.last_pane_check = 0.0
         self.started_at = time.time()
@@ -844,7 +845,11 @@ class App:
                            curses.color_pair(13 if sel else 1))
             self.row_at[y] = i + 1
             y += 1
-        stdscr.addnstr(H - 1, 1, "Esc 取消 · Enter 新建", W - 2,
+        self.cancel_zone = (1, cell_len("取消"))
+        stdscr.addnstr(H - 1, 1, "取消", W - 2,
+                       curses.color_pair(26 if self.hover == ("cancel",)
+                                         else 3))
+        stdscr.addnstr(H - 1, 6, "· Enter 新建", W - 5,
                        curses.color_pair(3))
         stdscr.refresh()
 
@@ -876,7 +881,11 @@ class App:
                 _, mx, my, _, bstate = curses.getmouse()
                 if bstate & (curses.BUTTON1_CLICKED
                              | curses.BUTTON1_PRESSED):
-                    if my in self.row_at:
+                    if my == H - 1 and (self.cancel_zone and
+                                        self.cancel_zone[0] <= mx <=
+                                        self.cancel_zone[1] + 1):
+                        self.picking = False   # 点击"取消" → 关闭选择器
+                    elif my in self.row_at:
                         idx = self.row_at[my]
                         if idx == -1:
                             self.entry_mode = True
