@@ -37,7 +37,7 @@ PER_GROUP = 6
 MIN_W_SAVE = 12          # 记忆展开宽度时的下限
 MAX_W = 40               # 记忆/允许的展开宽度上限
 W_COOLDOWN = 0.6         # 布局守卫纠宽的最小间隔(秒)
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # 工作中: 动态菊花帧, 对齐 Claude Code
+SPINNER = "·✢✳✶✻✽"       # 工作中: 星形旋转帧, 逐帧对齐 Claude Code
 
 ACCENT = 209             # 珊瑚 #d7875f(近 Anthropic D97757)
 GREEN = 114
@@ -240,7 +240,7 @@ def window_width() -> str:
 
 
 def live_status() -> dict:
-    """{sessionId: status} — 来自 claude agents --json 的原始状态"""
+    """{sessionId: {status, kind}} — 来自 claude agents --json"""
     try:
         out = subprocess.run(
             ["claude", "agents", "--json"],
@@ -255,29 +255,30 @@ def live_status() -> dict:
             continue
         sid = a.get("sessionId") or a.get("id")
         if sid:
-            live[sid] = str(a.get("status") or "")
+            live[sid] = {"status": str(a.get("status") or ""),
+                         "kind": str(a.get("kind") or "")}
     return live
 
 
 def status_glyph(sid: str, live: dict) -> tuple:
-    """(字符或 None=菊花动画, 状态种类) — 对齐 Claude Code fleet view:
-    工作中=菊花(珊瑚) 等待输入=✱(黄) 完成/停止/历史=∙(灰)
+    """(字符或 None=星形动画, 状态种类) — 逐项对齐 Claude Code fleet view:
+    工作中=星形旋转(珊瑚) 等待输入=✱(黄) 完成/停止/历史=•(灰)
     右栏正在显示的会话=✽(珊瑚) 失败=✱(红)"""
     st = live.get(sid)
     if st is None:
-        return ("∙", "dim")                  # 历史(未运行)
-    s = st.lower()
+        return ("•", "dim")                  # 历史(未运行)
+    s = (st.get("status") or "").lower() if isinstance(st, dict) else ""
     if sid == current_session_id():
         return ("✽", "accent")               # 右栏当前会话
     if "input" in s or "wait" in s:
         return ("✱", "yellow")               # 等待用户输入
     if s in ("busy", "working", "active", "running"):
-        return (None, "accent")              # 工作中(菊花)
+        return (None, "accent")              # 工作中(星形动画)
     if s in ("done", "completed"):
-        return ("∙", "dim")                  # 完成
+        return ("•", "dim")                  # 完成
     if "fail" in s or "error" in s:
         return ("✱", "red")                  # 失败
-    return ("∙", "dim")                      # 已停止/退出
+    return ("•", "dim")                      # 已停止/退出
 
 
 KIND_PAIR = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
@@ -301,7 +302,8 @@ def tmux(*args):
 
 
 def activate(row):
-    """点击某条会话: 右栏宿主 respawn 加载该会话(任何项目都就地切换)。"""
+    """点击某条会话: 右栏就地加载。正在运行的会话不会被复制:
+    后台运行的 attach 接管, 右栏当前的直接提示。"""
     pane = host_pane_id()
     if not pane:
         return "找不到宿主面板"
@@ -310,6 +312,20 @@ def activate(row):
     if row["id"] == current_session_id():
         return "已经在这里了"
     bin_dir = os.path.dirname(os.path.abspath(__file__))
+    live = live_status()
+    info = live.get(row["id"])
+    if info and info.get("kind") == "interactive":
+        return "该会话正在右栏运行"
+    if info:
+        # 后台运行中 → attach 接管(不 respawn --resume, 那会复制出新会话)
+        r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
+                 "env", f"SHANNON_DIR={row['cwd']}",
+                 f"SHANNON_ATTACH={row['id']}", f"{bin_dir}/shannon-host")
+        if r is not None and r.returncode == 0:
+            set_current_session(row["id"])
+            name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
+            return f"已接管后台会话: {name}"
+        return "接管失败"
     r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
              "env", f"SHANNON_DIR={row['cwd']}",
              f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
@@ -981,8 +997,10 @@ class App:
         now = time.time()
         now_ms = now * 1000
         minute = int(now // 60)
-        working = any(s in ("busy", "working", "active", "running")
-                      for s in live.values())
+        working = any(isinstance(v, dict)
+                      and (v.get("status") or "").lower()
+                      in ("busy", "working", "active", "running")
+                      for v in live.values())
         frame = int(now_ms / 120) % len(SPINNER)
         if (version != self.last_version or minute != self.last_minute
                 or (working and frame != self.last_frame)):

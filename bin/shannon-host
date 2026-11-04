@@ -12,7 +12,9 @@ cd "${SHANNON_DIR:-$HOME}" || cd "$HOME"
 trap '' INT
 
 while :; do
-  if [ -n "${SHANNON_RESUME:-}" ]; then
+  if [ -n "${SHANNON_ATTACH:-}" ]; then
+    "$CLAUDE_BIN" attach "$SHANNON_ATTACH"
+  elif [ -n "${SHANNON_RESUME:-}" ]; then
     "$CLAUDE_BIN" --resume "$SHANNON_RESUME"
   elif [ "${SHANNON_START:-fleet}" = "fleet" ]; then
     "$CLAUDE_BIN" agents
