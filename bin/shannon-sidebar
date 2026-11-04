@@ -305,6 +305,8 @@ def activate(row):
     pane = host_pane_id()
     if not pane:
         return "找不到宿主面板"
+    if row["id"].startswith("ghost:"):
+        return "会话启动中, 马上就好"
     if row["id"] == current_session_id():
         return "已经在这里了"
     bin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -329,6 +331,8 @@ class App:
         self.version = 0
         self.stop = threading.Event()
         self.order = None            # 首次加载时冻结的排序基准(id → mtime)
+        self.ghost = None            # 刚新建、transcript 尚未落盘的占位会话
+        self.wake = threading.Event()
         threading.Thread(target=self.refresh_loop, daemon=True).start()
 
         self.sel = 0            # 焦点行在 display 行里的序号
@@ -338,6 +342,8 @@ class App:
         self.picking = False    # 新建会话: 正在选择项目
         self.psel = 0           # picking 模式的焦点序号
         self.proj_list = []     # picking 模式的项目列表 [(cwd, name)]
+        self.entry_mode = False  # 正在输入全新路径
+        self.entry_buf = ""     # 路径输入缓冲
         self.hover = None       # ('row', idx) | ('collapse',) | ('exit',) | ('new',) | ('rail',)
         self.msg = ""
         self.msg_until = 0.0
@@ -371,6 +377,17 @@ class App:
         while not self.stop.is_set():
             rows = scan_sessions()
             live = live_status()
+            ghost = self.ghost
+            if ghost:
+                # 新会话的 transcript 落盘后, 占位行功成身退
+                real = any(r["cwd"] == ghost["cwd"]
+                           and r["mtime"] >= ghost["mtime"] - 5000
+                           for r in rows)
+                if real or time.time() > (ghost["mtime"] + 300000) / 1000:
+                    self.ghost = None
+                else:
+                    rows = [dict(ghost)] + [
+                        r for r in rows if r["cwd"] != ghost["cwd"]]
             with self.lock:
                 if self.order is None:
                     # 冻结初始排序: 之后点击/加载不再扰动顺序
@@ -384,7 +401,8 @@ class App:
                 self.live = live
                 self.ready = True
                 self.version += 1
-            self.stop.wait(REFRESH_SECS)
+            if self.wake.wait(REFRESH_SECS):
+                self.wake.clear()
 
     def snapshot(self):
         with self.lock:
@@ -781,25 +799,35 @@ class App:
         rows, _, _, _ = self.snapshot()
         H, W = stdscr.getmaxyx()
         self.proj_list = self.project_list(rows)
-        self.psel = max(0, min(self.psel, len(self.proj_list) - 1))
+        n = len(self.proj_list) + 1      # 顶部多一个"输入新路径"入口
+        self.psel = max(0, min(self.psel, n - 1))
         stdscr.erase()
         band = curses.color_pair(12) | curses.A_BOLD
         stdscr.addnstr(0, 1, "NEW SESSION → 选择项目", W - 2, band)
         if W > 9:
             stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
         y = 1
-        for i, (cwd, name) in enumerate(self.proj_list[: H - 3]):
-            sel = i == self.psel
+        sel0 = self.psel == 0
+        if sel0:
+            stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
+                           curses.color_pair(13))
+            stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
+        stdscr.addnstr(y, 2, "✎ 输入新路径…", W - 2,
+                       curses.color_pair(13 if sel0 else 26))
+        self.row_at[y] = -1              # -1 = 输入新路径入口
+        y += 1
+        for i, (cwd, name) in enumerate(self.proj_list):
+            if y > H - 2:
+                break
+            sel = self.psel == i + 1
             if sel:
                 stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
                                curses.color_pair(13))
                 stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
             stdscr.addnstr(y, 2, trunc(name, W - 4), W - 2,
                            curses.color_pair(13 if sel else 1))
-            self.row_at[y] = i
+            self.row_at[y] = i + 1
             y += 1
-        if not self.proj_list:
-            stdscr.addnstr(1, 1, "no projects yet", W - 2, curses.color_pair(3))
         stdscr.addnstr(H - 1, 1, "Esc 取消 · Enter 新建", W - 2,
                        curses.color_pair(3))
         stdscr.refresh()
@@ -812,18 +840,21 @@ class App:
                 self.picking = False
                 self.draw(stdscr)
             return
-        n = len(self.proj_list)
+        n = len(self.proj_list) + 1      # 含顶部"输入新路径"入口
+        self.psel = max(0, min(self.psel, n - 1))
         if ch in (curses.KEY_DOWN, ord("j")):
-            self.psel = min(self.psel + 1, max(0, n - 1))
+            self.psel = min(self.psel + 1, n - 1)
         elif ch in (curses.KEY_UP, ord("k")):
             self.psel = max(0, self.psel - 1)
         elif ch in (curses.KEY_ENTER, 10, 13):
-            if n and self.psel < n:
-                cwd = self.proj_list[self.psel][0]
+            if self.psel == 0:
+                self.entry_mode = True   # 输入新路径
+            elif self.psel - 1 < len(self.proj_list):
+                cwd = self.proj_list[self.psel - 1][0]
                 self.picking = False
                 self.toast(self.new_session(cwd))
                 self.draw(stdscr)
-                return
+            return
         elif ch == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
@@ -831,13 +862,73 @@ class App:
                              | curses.BUTTON1_PRESSED):
                     if my in self.row_at:
                         idx = self.row_at[my]
-                        if idx < len(self.proj_list):
-                            self.picking = False
+                        if idx == -1:
+                            self.entry_mode = True
+                        elif idx < len(self.proj_list):
                             cwd = self.proj_list[idx][0]
+                            self.picking = False
                             self.toast(self.new_session(cwd))
                             self.draw(stdscr)
             except curses.error:
                 pass
+
+    def draw_entry(self, stdscr):
+        try:
+            self._draw_entry(stdscr)
+        except curses.error:
+            pass
+
+    def _draw_entry(self, stdscr):
+        H, W = stdscr.getmaxyx()
+        stdscr.erase()
+        band = curses.color_pair(12) | curses.A_BOLD
+        stdscr.addnstr(0, 1, "NEW SESSION → 输入路径", W - 2, band)
+        if W > 9:
+            stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
+        shown = trunc(self.entry_buf, max(1, W - 6))
+        stdscr.addnstr(2, 1, "> ", W - 2, curses.color_pair(3))
+        stdscr.addnstr(2, 3, shown, W - 3, curses.color_pair(26))
+        stdscr.addnstr(2, 3 + cell_len(shown) + 1, "▌", 1,
+                       curses.color_pair(5))
+        hint = "Enter 确认(目录不存在会自动创建) · Esc 取消"
+        stdscr.addnstr(H - 1, 1, trunc(hint, W - 2), W - 2,
+                       curses.color_pair(3))
+        stdscr.refresh()
+
+    def tick_entry(self, stdscr):
+        self.draw_entry(stdscr)
+        ch = stdscr.get_wch()
+        if ch == 27:
+            # 裸 ESC → 回到 picking; 鼠标序列在输入态忽略
+            stdscr.timeout(40)
+            c2 = stdscr.getch()
+            stdscr.timeout(self.base_timeout)
+            if c2 == -1:
+                self.entry_mode = False
+                self.draw_picking(stdscr)
+            return
+        if ch in (curses.KEY_ENTER, 10, 13):
+            path = os.path.expanduser(self.entry_buf.strip())
+            if path.startswith("/") and os.path.basename(path):
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except OSError as e:
+                    self.toast(f"无法创建目录: {e.strerror}")
+                    self.draw(stdscr)
+                    return
+                self.entry_mode = False
+                self.picking = False
+                self.toast(self.new_session(path))
+                self.draw(stdscr)
+            else:
+                self.toast("需要绝对路径, 如 ~/code/new-project")
+            return
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.entry_buf = self.entry_buf[:-1]
+            self.draw_entry(stdscr)
+        elif isinstance(ch, str) and ch.isprintable():
+            self.entry_buf += ch
+            self.draw_entry(stdscr)
 
     def new_session(self, cwd):
         """在指定项目目录新建一个全新会话(右栏就地加载空白 claude)"""
@@ -851,6 +942,14 @@ class App:
         if r is not None and r.returncode == 0:
             set_current_session("")
             name = os.path.basename(cwd.rstrip("/")) or cwd
+            self.ghost = {
+                "id": f"ghost:{cwd}",
+                "cwd": cwd,
+                "project": name,
+                "title": f"新会话 · {name}",
+                "mtime": time.time() * 1000,
+            }
+            self.wake.set()          # 立即刷新, 新会话马上出现在列表里
             return f"新会话已创建: {name}"
         return "创建失败"
 
@@ -870,6 +969,9 @@ class App:
             # 记录后跳过本拍继续运行, 避免一次偶发错误杀死整个侧栏
 
     def _tick(self, stdscr):
+        if self.entry_mode:
+            self.tick_entry(stdscr)
+            return
         if self.picking:
             self.tick_picking(stdscr)
             return

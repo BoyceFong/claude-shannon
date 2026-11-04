@@ -61,7 +61,7 @@ Every other `claude` usage passes through untouched.
 - **In-place switching** — clicking a row respawns the right pane's Claude host on that conversation. Works across projects, not just the current one.
 - **Fleet view as home screen** — the right pane starts on Claude Code's own fleet view; everything you can do there, you can do here.
 - **Collapse to a rail** — `M-s` or the `◀ 收起` button shrinks the sidebar to a 2-column rail with a `▶` expand button at the bottom. Nothing is ever destroyed.
-- **New session in any project** — `＋ 新建` in the footer lists your known projects; pick one and a brand-new Claude Code session opens in that directory, in the right pane.
+- **New session in any project — or a brand-new one** — `＋ 新建` in the footer lists your known projects, plus a `✎ 输入新路径` entry: type any path (the directory is created if it doesn't exist) and a fresh Claude Code session opens there, in the right pane. The new session appears in the sidebar immediately.
 - **Quit from the sidebar** — `✕ 退出` in the footer, or `Ctrl+Q`, closes the whole workspace (Claude Code included).
 - **Pinned widths, no flicker** — the sidebar is a tmux `main-vertical` main pane: its width is held by tmux itself while you resize the window; only the right pane flexes. Crossing `COLLAPSE_AT` switches between expanded and rail.
 
