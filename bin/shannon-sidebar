@@ -138,6 +138,10 @@ def scan_sessions() -> list:
         return []
     files.sort(reverse=True)
     files = files[:SCAN_LIMIT]
+    ignored = load_ignored()
+    if ignored:
+        files = [(m, p) for m, p in files
+                 if os.path.basename(p)[:-6] not in ignored]
 
     rows = []
     for mtime, path in files:
@@ -217,6 +221,25 @@ def save_expanded_width(w: int) -> None:
     try:
         with open(os.path.join(STATE_DIR, "sidebar-w"), "w") as fh:
             fh.write(f"{w}\n")
+    except OSError:
+        pass
+
+
+def load_ignored() -> set:
+    """用户手动隐藏的会话 id(按 x)"""
+    try:
+        with open(os.path.join(STATE_DIR, "ignored.json")) as fh:
+            v = json.load(fh)
+        return set(v) if isinstance(v, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def ignore_ids(ids) -> None:
+    cur = load_ignored()
+    try:
+        with open(os.path.join(STATE_DIR, "ignored.json"), "w") as fh:
+            json.dump(sorted(cur | set(ids)), fh)
     except OSError:
         pass
 
@@ -1053,9 +1076,14 @@ class App:
         elif ch in (curses.KEY_UP, ord("k")):
             self.move(row_idx, -1)
             self.draw(stdscr)
-        elif ch in (curses.KEY_ENTER, 10, 13):
-            self.focus_visible = False      # 回车后撤掉灰底,直到下次方向键
-            self.open_selected(items, row_idx)
+        elif ch in (ord("x"), curses.KEY_DC):
+            # 隐藏焦点会话(数据不动, 只是不再显示)
+            if row_idx and self.sel < len(row_idx):
+                row = items[row_idx[self.sel]][1]
+                if not row["id"].startswith("ghost:"):
+                    ignore_ids([row["id"]])
+                    self.wake.set()
+                    self.toast("已隐藏该会话")
             self.draw(stdscr)
         elif ch == curses.KEY_MOUSE:
             try:
