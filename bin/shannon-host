@@ -8,6 +8,8 @@
 STATE_DIR="$HOME/.claude/shannon"
 CLAUDE_BIN=$(command -v claude || echo /opt/homebrew/bin/claude)
 cd "${SHANNON_DIR:-$HOME}" || cd "$HOME"
+# Ctrl+C 不杀宿主 shell: 在 claude 里它中断 claude, 在提示页它被忽略
+trap '' INT
 
 while :; do
   if [ -n "${SHANNON_RESUME:-}" ]; then
@@ -22,6 +24,6 @@ while :; do
     "$(date '+%H:%M:%S')" "$code" "${SHANNON_START:-fleet}" \
     "${SHANNON_RESUME:--}" >> "$STATE_DIR/host.log" 2>/dev/null
   printf '\n· claude 已退出 (code %s) — 回车重启 · 输入 q 回车收工\n' "$code"
-  read -r k
+  read -r k || exit 0     # stdin 关闭(面板被销毁)→ 收工
   [ "$k" = q ] && break
 done

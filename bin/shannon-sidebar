@@ -335,11 +335,15 @@ class App:
         self.focus_visible = True
         self.offset = 0         # 滚动
         self.rail = False       # rail 模式(收窄成细条)
-        self.hover = None       # ('row', idx) | ('collapse',) | ('exit',) | ('rail',)
+        self.picking = False    # 新建会话: 正在选择项目
+        self.psel = 0           # picking 模式的焦点序号
+        self.proj_list = []     # picking 模式的项目列表 [(cwd, name)]
+        self.hover = None       # ('row', idx) | ('collapse',) | ('exit',) | ('new',) | ('rail',)
         self.msg = ""
         self.msg_until = 0.0
         self.footer_btn_x = -1
         self.exit_zone = None   # ✕ 退出 的点击范围
+        self.new_zone = None    # ＋ 新建 的点击范围
         self.row_at = {}        # 屏幕行号 → display 行序号
         self.last_pane_check = 0.0
         self.started_at = time.time()
@@ -513,15 +517,18 @@ class App:
             stdscr.addnstr(1, 1, "no conversations yet", W - 2,
                            curses.color_pair(3))
 
-        # 底部: "✕ 退出"(左, 可点击) + "◀ 收起"(右, 可点击)
+        # 底部: "✕ 退出 · ＋ 新建"(左, 可点击) + "◀ 收起"(右, 可点击)
         btn = "◀ 收起"
-        left = "✕ 退出"
         self.footer_btn_x = max(1, W - 1 - cell_len(btn))
-        self.exit_zone = (1, cell_len(left))
-        if self.hover == ("exit",):
-            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(26))
-        else:
-            stdscr.addnstr(H - 1, 1, left, W - 2, curses.color_pair(3))
+        self.exit_zone = (1, cell_len("✕ 退出"))
+        self.new_zone = (1 + cell_len("✕ 退出 · "), cell_len("✕ 退出 · ＋ 新建"))
+        hover_exit = self.hover == ("exit",)
+        hover_new = self.hover == ("new",)
+        stdscr.addnstr(H - 1, 1, "✕ 退出", W - 2,
+                       curses.color_pair(26 if hover_exit else 3))
+        stdscr.addnstr(H - 1, 7, " · ", W - 7, curses.color_pair(3))
+        stdscr.addnstr(H - 1, 10, "＋ 新建", W - 10,
+                       curses.color_pair(26 if hover_new else 3))
         if self.hover == ("collapse",):
             stdscr.addnstr(H - 1, self.footer_btn_x, "◀", 1,
                            curses.color_pair(5) | curses.A_BOLD)
@@ -557,9 +564,12 @@ class App:
             self.act(lambda: subprocess.run([TOGGLE]))   # rail 点击 → 展开
             return
         if my == H - 1:
-            # 底部按钮区: ✕ 退出 · ◀ 收起(命中区放宽一格)
+            # 底部按钮区: ✕ 退出 · ＋ 新建 · ◀ 收起(命中区放宽一格)
             if (self.exit_zone and self.exit_zone[0] <= mx <= self.exit_zone[1]):
                 self.act(self.quit_session)
+            elif (self.new_zone and self.new_zone[0] <= mx <= self.new_zone[1]):
+                self.picking = True
+                self.psel = 0
             elif mx >= self.footer_btn_x - 1:
                 self.act(lambda: subprocess.run([TOGGLE]))
             return
@@ -690,7 +700,8 @@ class App:
 
     def handle_escape(self, stdscr, items, row_idx):
         """解码 SGR 鼠标序列 \x1b[<b;x;yM/m (ncurses 不认, 需自制解析)。
-        b: 0=左键按下 1=左键抬起 64/65=滚轮 32=悬停移动"""
+        b: 0=左键按下 1=左键抬起 64/65=滚轮 32=悬停移动
+        返回 True 表示这是一个"裸 ESC"(未组成鼠标序列)。"""
         H, W = stdscr.getmaxyx()
         stdscr.timeout(40)              # 序列剩余字节的最大等待
         seq = [27]
@@ -706,12 +717,12 @@ class App:
         finally:
             stdscr.timeout(self.base_timeout)
         if seq[1] != 91 or seq[2] != 60:
-            return                      # 其他 ESC 序列: 忽略
+            return True                 # 裸 ESC: 交回调用方(取消 picking 等)
         try:
             parts = "".join(chr(c) for c in seq[3:-1]).split(";")
             b, x, y = int(parts[0]), int(parts[1]), int(parts[2])
         except (ValueError, IndexError):
-            return
+            return False
         mx, my = x - 1, y - 1           # SGR 坐标从 1 起
         if b & 32 or b == 35:
             # 悬停移动(无按键)
@@ -726,11 +737,14 @@ class App:
                 elif (self.exit_zone
                       and self.exit_zone[0] <= mx <= self.exit_zone[1]):
                     new_hover = ("exit",)
+                elif (self.new_zone
+                      and self.new_zone[0] <= mx <= self.new_zone[1]):
+                    new_hover = ("new",)
             self.last_motion = time.time()
             if new_hover != self.hover:
                 self.hover = new_hover
                 self.draw(stdscr)
-            return
+            return False
         if b in (64, 65):               # 滚轮
             if b == 64:
                 self.offset = max(0, self.offset - 3)
@@ -738,11 +752,107 @@ class App:
                 self.offset = min(max(0, len(items) - 1) if items else 0,
                                   self.offset + 3)
             self.draw(stdscr)
-            return
+            return False
         if b == 0:                      # 左键按下 → 点击
             self.last_motion = time.time()
             self.click(my, mx, H, items, row_idx)
             self.draw(stdscr)
+        return False
+
+    def project_list(self, rows):
+        """picking 列表: 去重后的项目 (cwd, name), 按活跃度排序"""
+        out = []
+        seen = set()
+        for r in rows:
+            cwd = r.get("cwd")
+            if cwd and cwd not in seen:
+                seen.add(cwd)
+                name = os.path.basename(cwd.rstrip("/")) or r.get("project", cwd)
+                out.append((cwd, name))
+        return out
+
+    def draw_picking(self, stdscr):
+        try:
+            self._draw_picking(stdscr)
+        except curses.error:
+            pass
+
+    def _draw_picking(self, stdscr):
+        rows, _, _, _ = self.snapshot()
+        H, W = stdscr.getmaxyx()
+        self.proj_list = self.project_list(rows)
+        self.psel = max(0, min(self.psel, len(self.proj_list) - 1))
+        stdscr.erase()
+        band = curses.color_pair(12) | curses.A_BOLD
+        stdscr.addnstr(0, 1, "NEW SESSION → 选择项目", W - 2, band)
+        if W > 9:
+            stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
+        y = 1
+        for i, (cwd, name) in enumerate(self.proj_list[: H - 3]):
+            sel = i == self.psel
+            if sel:
+                stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
+                               curses.color_pair(13))
+                stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
+            stdscr.addnstr(y, 2, trunc(name, W - 4), W - 2,
+                           curses.color_pair(13 if sel else 1))
+            self.row_at[y] = i
+            y += 1
+        if not self.proj_list:
+            stdscr.addnstr(1, 1, "no projects yet", W - 2, curses.color_pair(3))
+        stdscr.addnstr(H - 1, 1, "Esc 取消 · Enter 新建", W - 2,
+                       curses.color_pair(3))
+        stdscr.refresh()
+
+    def tick_picking(self, stdscr):
+        self.draw_picking(stdscr)
+        ch = stdscr.getch()
+        if ch == 27:
+            if self.handle_escape(stdscr, [], []):
+                self.picking = False
+                self.draw(stdscr)
+            return
+        n = len(self.proj_list)
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.psel = min(self.psel + 1, max(0, n - 1))
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.psel = max(0, self.psel - 1)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if n and self.psel < n:
+                cwd = self.proj_list[self.psel][0]
+                self.picking = False
+                self.toast(self.new_session(cwd))
+                self.draw(stdscr)
+                return
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if bstate & (curses.BUTTON1_CLICKED
+                             | curses.BUTTON1_PRESSED):
+                    if my in self.row_at:
+                        idx = self.row_at[my]
+                        if idx < len(self.proj_list):
+                            self.picking = False
+                            cwd = self.proj_list[idx][0]
+                            self.toast(self.new_session(cwd))
+                            self.draw(stdscr)
+            except curses.error:
+                pass
+
+    def new_session(self, cwd):
+        """在指定项目目录新建一个全新会话(右栏就地加载空白 claude)"""
+        pane = host_pane_id()
+        if not pane:
+            return "找不到宿主面板"
+        bin_dir = os.path.dirname(os.path.abspath(__file__))
+        r = tmux("respawn-pane", "-k", "-t", pane, "-c", cwd,
+                 "env", f"SHANNON_DIR={cwd}", "SHANNON_START=blank",
+                 f"{bin_dir}/shannon-host")
+        if r is not None and r.returncode == 0:
+            set_current_session("")
+            name = os.path.basename(cwd.rstrip("/")) or cwd
+            return f"新会话已创建: {name}"
+        return "创建失败"
 
     def tick(self, stdscr):
         try:
@@ -760,6 +870,9 @@ class App:
             # 记录后跳过本拍继续运行, 避免一次偶发错误杀死整个侧栏
 
     def _tick(self, stdscr):
+        if self.picking:
+            self.tick_picking(stdscr)
+            return
         rows, live, ready, version = self.snapshot()
         items = self.display_items(rows)
         row_idx = [i for i, it in enumerate(items) if it[0] == "row"]
@@ -792,8 +905,12 @@ class App:
 
         ch = stdscr.getch()
         if ch == 27:
-            # SGR 鼠标序列(悬停/点击/滚轮)由我们自己解码 — 对齐 fleet view
-            self.handle_escape(stdscr, items, row_idx)
+            # SGR 鼠标序列(悬停/点击/滚轮)由我们自己解码 — 对齐 fleet view;
+            # 裸 ESC = 取消 picking
+            plain = self.handle_escape(stdscr, items, row_idx)
+            if plain and self.picking:
+                self.picking = False
+                self.draw(stdscr)
         elif ch == curses.KEY_RESIZE:
             stdscr.erase()
             self.draw(stdscr)
@@ -841,6 +958,9 @@ class App:
                         elif (self.exit_zone and
                               self.exit_zone[0] <= mx <= self.exit_zone[1]):
                             new_hover = ("exit",)
+                        elif (self.new_zone and
+                              self.new_zone[0] <= mx <= self.new_zone[1]):
+                            new_hover = ("new",)
                     if new_hover != self.hover:
                         self.hover = new_hover
                         self.draw(stdscr)
