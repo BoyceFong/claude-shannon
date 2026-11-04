@@ -46,7 +46,7 @@ printf 'fleet\n' > "$STATE_DIR/current-session"
 printf '%s\n' auto > "$STATE_DIR/mode"
 
 # main-vertical + main-pane-width: 窗口变化时侧栏宽度由 tmux 保持恒定
-tmux set-window-option -t "$SESS:0" main-pane-width "$START_W"
+tmux set-window-option -t "$SESS:0" main-pane-width "$INIT_W"
 tmux select-layout -t "$SESS:0" main-vertical
 tmux set-window-option -t "$SESS:0" remain-on-exit on || true
 

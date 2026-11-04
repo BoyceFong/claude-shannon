@@ -9,6 +9,7 @@
 import curses
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -30,10 +31,13 @@ def log(msg: str) -> None:
     except OSError:
         pass
 
-SCAN_LIMIT = 48          # 最多读多少个最新的会话文件
+SCAN_LIMIT = 80          # 最多分析多少个最新的 transcript 文件
 REFRESH_SECS = 15        # 数据刷新周期
 MAX_GROUPS = 12
 PER_GROUP = 6
+HEAD_BYTES = 192 * 1024  # 每个文件读头部: 首条用户消息 / cwd / summary
+TAIL_BYTES = 256 * 1024  # 每个文件读尾部: 最新规范标题 / continued-in 血缘
+COLLISION_RE = re.compile(r"^(?P<base>.+?) \(\d+\)$")
 MIN_W_SAVE = 12          # 记忆展开宽度时的下限
 MAX_W = 40               # 记忆/允许的展开宽度上限
 W_COOLDOWN = 0.6         # 布局守卫纠宽的最小间隔(秒)
@@ -121,8 +125,125 @@ def first_user_text(entry: dict) -> str:
     return ""
 
 
-def scan_sessions() -> list:
-    """最新的会话记录 → [{id, cwd, project, title, mtime}]"""
+def _entries(raw_lines):
+    """逐行解析 jsonl; 坏行直接丢弃。"""
+    for raw in raw_lines:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def _head_entries(path: str, size: int):
+    """文件头部分: 第一条真实用户消息、cwd、summary 都在这里。"""
+    cap = min(size, HEAD_BYTES)
+    if cap <= 0:
+        return
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        used = 0
+        for line in fh:
+            used += len(line)
+            for entry in _entries((line,)):
+                yield entry
+            if used > cap:          # 跨过边界的这一行也要解析, 否则可能丢首条消息
+                break
+
+
+def _tail_entries(path: str, size: int):
+    """文件尾部分: Claude Code 会持续重写标题, 续接关系也写在末尾。"""
+    cap = min(TAIL_BYTES, max(0, size - HEAD_BYTES))
+    if cap <= 0:
+        return
+    start = size - cap
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        data = fh.read()
+        partial = False
+        if start > 0:              # 判断起点是否落在行中间
+            fh.seek(start - 1)
+            partial = fh.read(1) != b"\n"
+    lines = data.split(b"\n")
+    if partial:
+        lines = lines[1:]          # 丢掉被截断的首行
+    for entry in _entries(lines):
+        yield entry
+
+
+# 标题字段按可信度排序: 用户改名 > agent 显示名(=fleet view 显示的名字) > AI 自动标题
+TITLE_FIELDS = (("custom", "customTitle"), ("agent", "agentName"),
+                ("ai", "aiTitle"))
+
+
+def _take_title(seg: dict, entry: dict) -> None:
+    """同一个文件里后写的标题覆盖先写的。"""
+    for key, field in TITLE_FIELDS:
+        value = entry.get(field)
+        if isinstance(value, str) and value.strip():
+            seg[key] = value.strip()
+
+
+def scan_segment(path: str, mtime: float) -> dict:
+    """一个 transcript 文件 = 会话的一个分段(segment), 不是会话本身。"""
+    sid = os.path.basename(path)[:-6]
+    seg = {
+        "id": sid,
+        "path": path,
+        "project": os.path.basename(os.path.dirname(path)),
+        "mtime": mtime * 1000,
+        "cwd": "",
+        "summary": "",
+        "first": "",
+        "root_uuid": "",      # 第一条真实用户消息的 uuid = 会话的稳定身份
+        "custom": "",         # 用户改的名字
+        "agent": "",          # fleet view / 提示框显示的名字
+        "ai": "",             # AI 自动标题
+        "cont_targets": [],   # 本分段续接到了哪些 session id
+        "has_messages": False,
+    }
+    try:
+        size = os.path.getsize(path)
+        for entry in _head_entries(path, size):
+            if not seg["cwd"] and isinstance(entry.get("cwd"), str):
+                seg["cwd"] = entry["cwd"]
+            etype = entry.get("type")
+            if etype == "summary" and not seg["summary"]:
+                seg["summary"] = str(entry.get("summary") or "")
+            elif (etype == "user" and not seg["root_uuid"]
+                  and not entry.get("isMeta")
+                  and not entry.get("isSidechain")):
+                text = first_user_text(entry)
+                if text:
+                    seg["root_uuid"] = str(entry.get("uuid") or "")
+                    seg["first"] = text
+            if etype in ("user", "assistant"):
+                seg["has_messages"] = True
+            _take_title(seg, entry)
+
+        for entry in _tail_entries(path, size):
+            if not seg["cwd"] and isinstance(entry.get("cwd"), str):
+                seg["cwd"] = entry["cwd"]
+            if entry.get("type") == "continued-in":
+                target = entry.get("continuedInSessionId")
+                if (isinstance(target, str) and target
+                        and target not in seg["cont_targets"]):
+                    seg["cont_targets"].append(target)
+            if entry.get("type") in ("user", "assistant"):
+                seg["has_messages"] = True
+            _take_title(seg, entry)
+    except OSError:
+        return {}
+    return seg
+
+
+def scan_segments() -> list:
+    """所有最近的 transcript 分段, 未去重。"""
     files = []
     try:
         for d in os.scandir(PROJECTS_DIR):
@@ -137,52 +258,133 @@ def scan_sessions() -> list:
     except OSError:
         return []
     files.sort(reverse=True)
-    files = files[:SCAN_LIMIT]
-    ignored = load_ignored()
-    if ignored:
-        files = [(m, p) for m, p in files
-                 if os.path.basename(p)[:-6] not in ignored]
+    segs = []
+    for mtime, path in files[:SCAN_LIMIT]:
+        seg = scan_segment(path, mtime)
+        if seg:
+            segs.append(seg)
+    return segs
 
-    rows = []
-    for mtime, path in files:
-        sid = os.path.basename(path)[:-6]
-        project = os.path.basename(os.path.dirname(path))
-        cwd = ""
-        summary = ""
-        first = ""
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                for i, line in enumerate(fh):
-                    if i >= 30:
-                        break
-                    try:
-                        entry = json.loads(line)
-                    except (ValueError, TypeError):
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    if not cwd and isinstance(entry.get("cwd"), str):
-                        cwd = entry["cwd"]
-                    etype = entry.get("type")
-                    if etype == "summary" and not summary:
-                        summary = str(entry.get("summary") or "")
-                    elif (etype == "user" and not first
-                          and not entry.get("isMeta")
-                          and not entry.get("isSidechain")):
-                        first = first_user_text(entry)
-                    if cwd and summary and first:
-                        break
-        except OSError:
+
+def live_rank(info: dict) -> int:
+    """活着的 worker 有多值得作为会话代表: 工作中 > 等输入 > 空闲/完成。"""
+    status = str(info.get("status") or "").lower()
+    state = str(info.get("state") or "").lower()
+    if status in ("busy", "working", "active", "running"):
+        return 3
+    if ("input" in status or "wait" in status
+            or state in ("blocked", "waiting", "needs_input")):
+        return 2
+    if state in ("done", "completed", "stopped") or status == "idle":
+        return 1
+    return 0
+
+
+def pick_title(members: list) -> str:
+    """会话级标题, 不是分段级。
+
+    Claude Code 把规范标题写在 transcript 里; fleet view 显示的是它。
+    同一会话的多个 fork 会被 fleet 用 " (2)" 后缀区分重名 —— 那是
+    展示层的碰撞消歧, 不是会话标题, 所以优先选没有后缀的那个。
+    """
+    for key in ("custom", "agent", "ai"):
+        values = [m[key] for m in members if m.get(key)]
+        clean = [v for v in values if not COLLISION_RE.match(v)]
+        if clean:
+            return clean[0]
+    for key in ("custom", "agent", "ai"):
+        values = [m[key] for m in members if m.get(key)]
+        if values:
+            match = COLLISION_RE.match(values[0])
+            return match.group("base") if match else values[0]
+    for m in members:
+        if m.get("summary"):
+            return clean_title(m["summary"])
+    for m in members:
+        if m.get("first"):
+            return clean_title(m["first"])
+    return "Untitled"
+
+
+def order_key(row: dict) -> str:
+    """排序身份的锚点: 同一会话的代表分段变了, 排序位置也不跳。"""
+    return f"root:{row['root']}" if row.get("root") else row["id"]
+
+
+def build_conversations(segments: list, live: dict, ignored: set) -> list:
+    """把 transcript 分段折叠成会话。
+
+    同一会话的判据(两条都是 Claude Code 自己写进 transcript 的事实):
+      1. 首条真实用户消息 uuid 相同 —— fork 会复制历史, uuid 不变;
+      2. continued-in 指向的分段也在扫描范围内。
+    之后每个会话只留一行, 代表分段优先选活着的 worker, 否则选最新且有内容的。
+    """
+    parent = {s["id"]: s["id"] for s in segments}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    ids = set(parent)
+    by_root = {}
+    for seg in segments:
+        root = seg["root_uuid"]
+        if root:
+            if root in by_root:
+                union(by_root[root], seg["id"])
+            else:
+                by_root[root] = seg["id"]
+    for seg in segments:
+        for target in seg["cont_targets"]:
+            if target in ids:
+                union(seg["id"], target)
+
+    families = {}
+    for seg in segments:
+        families.setdefault(find(seg["id"]), []).append(seg)
+
+    convs = []
+    for members in families.values():
+        members.sort(key=lambda s: s["mtime"], reverse=True)
+        fam_ids = [s["id"] for s in members]
+        root = next((s["root_uuid"] for s in members if s["root_uuid"]), "")
+        if any(i in ignored for i in fam_ids):
             continue
-        title = clean_title(summary or first or "Untitled")
-        rows.append({
-            "id": sid,
+        if root and f"root:{root}" in ignored:
+            continue
+
+        live_members = [s for s in members if s["id"] in live]
+        live_members.sort(
+            key=lambda s: (live_rank(live[s["id"]]), s["mtime"]), reverse=True)
+        # 既没有内容、也没有活着的 worker: 只是元数据残留, 不配占一行
+        if not any(s["has_messages"] for s in members) and not live_members:
+            continue
+
+        if live_members:
+            rep = live_members[0]
+        else:
+            rep = next((s for s in members if s["has_messages"]), members[0])
+        ordered = [rep] + [s for s in members if s is not rep]
+        cwd = next((s["cwd"] for s in ordered if s["cwd"]), "")
+        convs.append({
+            "id": rep["id"],
+            "live_id": live_members[0]["id"] if live_members else "",
+            "ids": fam_ids,
+            "root": root,
             "cwd": cwd,
-            "project": project,
-            "title": title,
-            "mtime": mtime * 1000,
+            "project": next((s["project"] for s in ordered), ""),
+            "title": pick_title(members),
+            "mtime": max(s["mtime"] for s in members),
+            "has_messages": any(s["has_messages"] for s in members),
         })
-    return rows
+    return convs
 
 
 def host_pane_id() -> str:
@@ -262,8 +464,25 @@ def window_width() -> str:
     return r.stdout.strip() if r else ""
 
 
+def pid_alive(pid) -> bool:
+    """agents --json 会留下已经死掉的 worker, 不能拿它们当"正在运行"。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True                         # 没给 pid: 无法证伪, 当作活着
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def live_status() -> dict:
-    """{sessionId: {status, kind}} — 来自 claude agents --json"""
+    """{sessionId: {status, kind, state, pid}} — 来自 claude agents --json"""
     try:
         out = subprocess.run(
             ["claude", "agents", "--json"],
@@ -277,29 +496,47 @@ def live_status() -> dict:
         if not isinstance(a, dict):
             continue
         sid = a.get("sessionId") or a.get("id")
-        if sid:
-            live[sid] = {"status": str(a.get("status") or ""),
-                         "kind": str(a.get("kind") or "")}
+        if not sid:
+            continue
+        if "pid" in a and not pid_alive(a.get("pid")):
+            continue
+        live[sid] = {"status": str(a.get("status") or ""),
+                     "kind": str(a.get("kind") or ""),
+                     "state": str(a.get("state") or ""),
+                     "pid": a.get("pid")}
     return live
 
 
-def status_glyph(sid: str, live: dict) -> tuple:
+def status_glyph(row: dict, live: dict, current: bool) -> tuple:
     """(字符或 None=星形动画, 状态种类) — 逐项对齐 Claude Code fleet view:
     工作中=星形旋转(珊瑚) 等待输入=✱(黄) 完成/停止/历史=•(灰)
-    右栏正在显示的会话=✽(珊瑚) 失败=✱(红)"""
-    st = live.get(sid)
-    if st is None:
-        return ("•", "dim")                  # 历史(未运行)
-    s = (st.get("status") or "").lower() if isinstance(st, dict) else ""
-    if sid == current_session_id():
+    右栏正在显示的会话=✽(珊瑚) 失败=✱(红)
+
+    状态取自会话的代表 worker; 一个会话有多个 fork 时, 只要有活着的
+    worker, 就用活得最"热"的那个的状态。"""
+    if current:
         return ("✽", "accent")               # 右栏当前会话
-    if "input" in s or "wait" in s:
+    if row.get("starting"):
+        return (None, "accent")              # 新建会话启动中
+    info = live.get(row.get("live_id") or "")
+    if info is None:
+        for sid in row.get("ids", ()):        # live_id 刚失效时在族内兜底
+            if sid in live:
+                info = live[sid]
+                break
+    if info is None:
+        return ("•", "dim")                  # 历史(未运行)
+    status = (info.get("status") or "").lower()
+    state = (info.get("state") or "").lower()
+    if ("input" in status or "wait" in status
+            or state in ("blocked", "waiting", "needs_input")):
         return ("✱", "yellow")               # 等待用户输入
-    if s in ("busy", "working", "active", "running"):
+    if (status in ("busy", "working", "active", "running")
+            or state in ("working", "running")):
         return (None, "accent")              # 工作中(星形动画)
-    if s in ("done", "completed"):
+    if state in ("done", "completed") or status in ("done", "completed"):
         return ("•", "dim")                  # 完成
-    if "fail" in s or "error" in s:
+    if "fail" in status or "error" in status or state in ("failed", "error"):
         return ("✱", "red")                  # 失败
     return ("•", "dim")                      # 已停止/退出
 
@@ -325,28 +562,33 @@ def tmux(*args):
 
 
 def activate(row):
-    """点击某条会话: 右栏就地加载。正在运行的会话不会被复制:
-    后台运行的 attach 接管, 右栏当前的直接提示。"""
+    """点击某个会话: 右栏就地加载。
+
+    会话身份优先用活着的 worker(attach, 不复制); 只有在没有活 worker
+    时才 --resume 一个历史分段。--resume 默认复用原 session id,
+    不加 --fork-session, 所以从这里打开会话永远不会再造出副本。"""
     pane = host_pane_id()
     if not pane:
         return "找不到宿主面板"
     if row["id"].startswith("ghost:"):
         return "会话启动中, 马上就好"
-    if row["id"] == current_session_id():
+    if current_session_id() in row.get("ids", (row["id"],)):
         return "已经在这里了"
     bin_dir = os.path.dirname(os.path.abspath(__file__))
     live = live_status()
-    info = live.get(row["id"])
-    if info and info.get("kind") == "interactive":
-        return "该会话正在右栏运行"
-    if info:
-        # 后台运行中 → attach 接管(不 respawn --resume, 那会复制出新会话)
+    # 族里所有活着的 worker, 最热的优先
+    live_ids = [sid for sid in row.get("ids", ()) if sid in live]
+    live_ids.sort(key=lambda sid: live_rank(live[sid]), reverse=True)
+    name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
+    if live_ids:
+        target = live_ids[0]
+        if live[target].get("kind") == "interactive":
+            return "该会话正在其他终端运行"
         r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
                  "env", f"SHANNON_DIR={row['cwd']}",
-                 f"SHANNON_ATTACH={row['id']}", f"{bin_dir}/shannon-host")
+                 f"SHANNON_ATTACH={target}", f"{bin_dir}/shannon-host")
         if r is not None and r.returncode == 0:
-            set_current_session(row["id"])
-            name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
+            set_current_session(target)
             return f"已接管后台会话: {name}"
         return "接管失败"
     r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
@@ -354,7 +596,6 @@ def activate(row):
              f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
     if r is not None and r.returncode == 0:
         set_current_session(row["id"])
-        name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
         return f"已切换到 {name}"
     return "切换失败"
 
@@ -415,8 +656,9 @@ class App:
     # -- 后台刷新 -----------------------------------------------------
     def refresh_loop(self):
         while not self.stop.is_set():
-            rows = scan_sessions()
+            segments = scan_segments()
             live = live_status()
+            rows = build_conversations(segments, live, load_ignored())
             ghost = self.ghost
             if ghost:
                 # 新会话的 transcript 落盘后, 占位行功成身退
@@ -431,10 +673,10 @@ class App:
             with self.lock:
                 if self.order is None:
                     # 冻结初始排序: 之后点击/加载不再扰动顺序
-                    self.order = {r["id"]: r["mtime"] for r in rows}
+                    self.order = {order_key(r): r["mtime"] for r in rows}
                 order = dict(self.order)
             for r in rows:
-                r["_k"] = order.get(r["id"], r["mtime"])
+                r["_k"] = order.get(order_key(r), r["mtime"])
             rows.sort(key=lambda r: r["_k"], reverse=True)
             with self.lock:
                 self.rows = rows
@@ -450,19 +692,23 @@ class App:
 
     # -- 展示模型 -----------------------------------------------------
     def display_items(self, rows):
-        """[('group', name) | ('row', row)] — 分组、限量(顺序沿用 rows)"""
+        """[('group', name) | ('row', row)] — 分组、限量(顺序沿用 rows)
+
+        分组身份用完整 cwd, 显示名才用 basename: ~/work/app 和
+        ~/personal/app 是两个项目, 不能因为同名就合并。"""
         groups = {}
         for r in rows:
-            if r["cwd"]:
-                name = os.path.basename(r["cwd"].rstrip("/")) or r["project"]
-                groups.setdefault(name, []).append(r)
+            key = r["cwd"] or r["project"]
+            name = (os.path.basename(r["cwd"].rstrip("/")) or r["project"]
+                    if r["cwd"] else r["project"])
+            groups.setdefault(key, {"name": name, "rows": []})["rows"].append(r)
         items = []
-        gs = sorted(groups.items(),
-                    key=lambda kv: max(x["_k"] for x in kv[1]),
+        gs = sorted(groups.values(),
+                    key=lambda g: max(x["_k"] for x in g["rows"]),
                     reverse=True)
-        for name, g in gs[:MAX_GROUPS]:
-            items.append(("group", name))
-            for r in g[:PER_GROUP]:
+        for g in gs[:MAX_GROUPS]:
+            items.append(("group", g["name"]))
+            for r in g["rows"][:PER_GROUP]:
                 items.append(("row", r))
         return items
 
@@ -497,6 +743,7 @@ class App:
         row_idx = [i for i, it in enumerate(items) if it[0] == "row"]
         self.sel = max(0, min(self.sel, len(row_idx) - 1))
         view_rows = max(1, H - 2)
+        cur = current_session_id()
 
         # 滚动: 焦点行保持可见
         if row_idx and self.focus_visible:
@@ -534,9 +781,9 @@ class App:
                           and self.sel < len(row_idx)
                           and row_idx[self.sel] == i)
                 hovered = self.hover == ("row", i)
-                current = row["id"] == current_session_id()
+                current = bool(cur) and cur in row.get("ids", (row["id"],))
                 t = ago(row["mtime"], now_ms)
-                gch, gkind = status_glyph(row["id"], live)
+                gch, gkind = status_glyph(row, live, current)
                 room = max(6, W - cell_len(t) - 6)
                 title = trunc(row["title"], room)
                 if gch is None:   # 工作中 → 菊花当前帧
@@ -945,7 +1192,10 @@ class App:
 
     def tick_entry(self, stdscr):
         self.draw_entry(stdscr)
-        ch = stdscr.get_wch()
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            return          # get_wch 在 timeout 无输入时抛错, 跳过本拍
         if ch == 27:
             # 裸 ESC → 回到 picking; 鼠标序列在输入态忽略
             stdscr.timeout(40)
@@ -990,12 +1240,18 @@ class App:
         if r is not None and r.returncode == 0:
             set_current_session("")
             name = os.path.basename(cwd.rstrip("/")) or cwd
+            gid = f"ghost:{cwd}"
             self.ghost = {
-                "id": f"ghost:{cwd}",
+                "id": gid,
+                "live_id": "",
+                "ids": [gid],
+                "root": "",
                 "cwd": cwd,
                 "project": name,
                 "title": f"新会话 · {name}",
                 "mtime": time.time() * 1000,
+                "has_messages": True,
+                "starting": True,
             }
             self.wake.set()          # 立即刷新, 新会话马上出现在列表里
             return f"新会话已创建: {name}"
@@ -1081,7 +1337,11 @@ class App:
             if row_idx and self.sel < len(row_idx):
                 row = items[row_idx[self.sel]][1]
                 if not row["id"].startswith("ghost:"):
-                    ignore_ids([row["id"]])
+                    # 隐藏整个会话族(而不只是当前分段), 否则 fork 会重新冒出来
+                    ids = list(row.get("ids") or [row["id"]])
+                    if row.get("root"):
+                        ids.append(f"root:{row['root']}")
+                    ignore_ids(ids)
                     self.wake.set()
                     self.toast("已隐藏该会话")
             self.draw(stdscr)
@@ -1125,6 +1385,20 @@ class App:
                 pass
 
 
+def dump():
+    """调试视图: 打印折叠后的会话(不启动 curses)。"""
+    segments = scan_segments()
+    live = live_status()
+    rows = build_conversations(segments, live, load_ignored())
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    now_ms = time.time() * 1000
+    for r in rows:
+        print(f'{r["id"][:8]} {ago(r["mtime"], now_ms):>4} '
+              f'live={r["live_id"][:8] or "-":8} ids={len(r["ids"])} '
+              f'cwd={r["cwd"] or "-"} | {r["title"]}')
+    print(f"-- {len(segments)} segments -> {len(rows)} conversations")
+
+
 def main():
     def _run(stdscr):
         App().run(stdscr)
@@ -1135,4 +1409,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--dump" in sys.argv:
+        dump()
+    else:
+        main()
