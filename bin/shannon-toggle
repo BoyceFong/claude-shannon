@@ -4,11 +4,22 @@
 # 若布局未生效(面板次序异常)则退回 resize-pane 纠正。
 
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
-STATE_DIR="$HOME/.claude/shannon"
 SESS="${SHANNON_SESSION:-shannon}"
-. "$STATE_DIR/config" 2>/dev/null || true
-SIDEBAR_W=${SIDEBAR_W:-35}
-RAIL_W=${RAIL_W:-2}
+# 与 shannon-workspace 保持同一套状态目录规则
+if [ "$SESS" = "shannon" ]; then
+  STATE_DIR="$HOME/.claude/shannon"
+else
+  SAFE_SESS=$(printf '%s' "$SESS" | tr -c 'A-Za-z0-9_-' '_')
+  STATE_DIR="$HOME/.claude/shannon/sessions/$SAFE_SESS"
+fi
+# config 用逐行解析而不是 source: 状态文件里即使混进 shell 代码也不会被执行
+cfg() { # cfg KEY DEFAULT
+  v=$(awk -F= -v k="$1" '$1==k && $2 ~ /^[0-9]+$/ {v=$2} END {print v}' \
+      "$STATE_DIR/config" 2>/dev/null)
+  printf '%s\n' "${v:-$2}"
+}
+SIDEBAR_W=$(cfg SIDEBAR_W 35)
+RAIL_W=$(cfg RAIL_W 2)
 
 # 展开宽度 = 用户记忆值, 限制在 [12, 35]
 EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)

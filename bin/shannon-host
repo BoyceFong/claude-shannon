@@ -5,7 +5,15 @@
 #   SHANNON_RESUME  指定要加载的会话 id (侧栏点击时由 respawn 注入)
 # claude 退出后停在提示页: 回车重启同一内容, 输入 q 回车收工(面板关闭)。
 
-STATE_DIR="$HOME/.claude/shannon"
+SESS="${SHANNON_SESSION:-shannon}"
+# 与 shannon-workspace 保持同一套状态目录规则(host.log 按会话分开)
+if [ "$SESS" = "shannon" ]; then
+  STATE_DIR="$HOME/.claude/shannon"
+else
+  SAFE_SESS=$(printf '%s' "$SESS" | tr -c 'A-Za-z0-9_-' '_')
+  STATE_DIR="$HOME/.claude/shannon/sessions/$SAFE_SESS"
+fi
+mkdir -p "$STATE_DIR" 2>/dev/null || true
 CLAUDE_BIN=$(command -v claude || echo /opt/homebrew/bin/claude)
 cd "${SHANNON_DIR:-$HOME}" || cd "$HOME"
 # Ctrl+C 不杀宿主 shell: 在 claude 里它中断 claude, 在提示页它被忽略

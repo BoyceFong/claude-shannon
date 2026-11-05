@@ -6,8 +6,14 @@
 
 set -e
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
-STATE_DIR="$HOME/.claude/shannon"
 SESS="${SHANNON_SESSION:-shannon}"
+# 默认会话沿用旧路径(向后兼容); 其他会话各自独立目录, 多实例互不踩状态
+if [ "$SESS" = "shannon" ]; then
+  STATE_DIR="$HOME/.claude/shannon"
+else
+  SAFE_SESS=$(printf '%s' "$SESS" | tr -c 'A-Za-z0-9_-' '_')
+  STATE_DIR="$HOME/.claude/shannon/sessions/$SAFE_SESS"
+fi
 mkdir -p "$STATE_DIR"
 DIR="${1:-$PWD}"
 
@@ -21,10 +27,16 @@ if [ ! -f "$STATE_DIR/config" ]; then
     echo "SIDEBAR_W=${SHANNON_SIDEBAR_W:-35}"
     echo "COLLAPSE_AT=${SHANNON_COLLAPSE_AT:-70}"
     echo "RAIL_W=2"
+    echo "SHOW_HISTORY=${SHANNON_SHOW_HISTORY:-0}"
   } > "$STATE_DIR/config"
 fi
-. "$STATE_DIR/config"
-SIDEBAR_W=${SIDEBAR_W:-35}
+# config 用逐行解析而不是 source: 状态文件里即使混进 shell 代码也不会被执行
+cfg() { # cfg KEY DEFAULT
+  v=$(awk -F= -v k="$1" '$1==k && $2 ~ /^[0-9]+$/ {v=$2} END {print v}' \
+      "$STATE_DIR/config" 2>/dev/null)
+  printf '%s\n' "${v:-$2}"
+}
+SIDEBAR_W=$(cfg SIDEBAR_W 35)
 
 # 初始侧栏宽度优先用上次记住的展开宽度, 限制在 [12, 35]
 # (|| true 兜底: set -e 下文件不存在时 cat 的失败不能杀死脚本)
@@ -37,9 +49,10 @@ case "$INIT_W" in ''|*[!0-9]*) INIT_W=$SIDEBAR_W ;; esac
 # -x/-y 给出接近真实终端的初始尺寸, 避免 attach 时的二次重排闪变。
 # 启动永远展开到记忆宽度(折叠只是会话内临时状态), mode 归零。
 SIDEBAR_PANE=$(tmux new-session -d -s "$SESS" -c "$HOME" -x 220 -y 40 \
-  -P -F '#{pane_id}' "$BIN_DIR/shannon-sidebar")
+  -P -F '#{pane_id}' env SHANNON_SESSION="$SESS" "$BIN_DIR/shannon-sidebar")
 HOST_PANE=$(tmux split-window -h -t "$SIDEBAR_PANE" -c "$DIR" -P -F '#{pane_id}' \
-  env SHANNON_START="${SHANNON_START:-fleet}" SHANNON_DIR="$DIR" "$BIN_DIR/shannon-host")
+  env SHANNON_SESSION="$SESS" SHANNON_START="${SHANNON_START:-fleet}" \
+  SHANNON_DIR="$DIR" "$BIN_DIR/shannon-host")
 printf '%s\n' "$HOST_PANE" > "$STATE_DIR/host-pane"
 printf '%s\n' "$SIDEBAR_PANE" > "$STATE_DIR/sidebar-pane"
 printf 'fleet\n' > "$STATE_DIR/current-session"
@@ -54,16 +67,22 @@ tmux set-window-option -t "$SESS:0" remain-on-exit on || true
 tmux set-option -t "$SESS" mouse on || true
 tmux set-option -t "$SESS" pane-border-lines single || true
 tmux set-option -t "$SESS" pane-border-style "fg=colour239" || true
+# 活动面板边框默认是绿色, 焦点切换时那条半截绿线会跟着动; 统一成同一暗色
+tmux set-option -t "$SESS" pane-active-border-style "fg=colour239" || true
 tmux set-option -t "$SESS" pane-border-status off || true
-tmux set-option -g escape-time 0 || true
 tmux set-option -t "$SESS" status off || true
 
-# M-s 折叠/展开 · Ctrl+Q 退出工作区 · 焦点事件(claude/侧栏点击响应需要)
-tmux bind-key -n M-s run-shell "$BIN_DIR/shannon-toggle" || true
-tmux bind-key -n C-q kill-session || true
-tmux set-option -g focus-events on || true
-tmux set-hook -t "$SESS" client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
-tmux set-hook -g client-resized "run-shell '$BIN_DIR/shannon-autofit'" || true
+# M-s 折叠/展开 · Ctrl+Q 退出工作区。
+# 按键绑定是服务器级的, 无法按会话限定; 所以用 if-shell 守卫:
+# 只在 shannon 会话里执行动作, 其他会话把按键原样转发, 不劫持。
+tmux bind-key -n M-s if-shell "test '#{session_name}' = '$SESS'" \
+  "run-shell \"SHANNON_SESSION='$SESS' '$BIN_DIR/shannon-toggle'\"" \
+  "send-keys M-s" || true
+tmux bind-key -n C-q if-shell "test '#{session_name}' = '$SESS'" \
+  "kill-session -t '$SESS'" "send-keys C-q" || true
+# 会话级 hook 就够了(实测会随该会话的 client resize 触发); 不再装全局 hook
+tmux set-hook -t "$SESS" client-resized \
+  "run-shell \"SHANNON_SESSION='$SESS' '$BIN_DIR/shannon-autofit'\"" || true
 
 tmux select-pane -t "$HOST_PANE"
 exec tmux attach-session -t "$SESS"

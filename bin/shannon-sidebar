@@ -20,8 +20,15 @@ from datetime import datetime
 HOME = os.path.expanduser("~")
 PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
-STATE_DIR = os.path.join(HOME, ".claude", "shannon")
 SESSION = os.environ.get("SHANNON_SESSION", "shannon")
+# 与 shell 侧同一套规则: 默认会话沿用旧路径, 其他会话各自独立子目录
+if SESSION == "shannon":
+    STATE_DIR = os.path.join(HOME, ".claude", "shannon")
+else:
+    STATE_DIR = os.path.join(HOME, ".claude", "shannon", "sessions",
+                             re.sub(r"[^A-Za-z0-9_-]", "_", SESSION))
+PANES_FILE = os.path.join(STATE_DIR, "panes.json")
+PANE_LOCK = threading.Lock()
 TOGGLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shannon-toggle")
 AUTOFIT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shannon-autofit")
 
@@ -42,6 +49,7 @@ TAIL_BYTES = 256 * 1024  # 每个文件读尾部: 最新规范标题 / continued
 COLLISION_RE = re.compile(r"^(?P<base>.+?) \(\d+\)$")
 MIN_W_SAVE = 12          # 记忆展开宽度时的下限
 MAX_W = 40               # 记忆/允许的展开宽度上限
+MAX_PARKED = 6           # 后台挂起(已打开但不在右栏)的会话面板上限
 W_COOLDOWN = 0.6         # 布局守卫纠宽的最小间隔(秒)
 SPINNER = "·✢✳✶✻✽"       # 工作中: 星形旋转帧, 逐帧对齐 Claude Code
 
@@ -53,7 +61,10 @@ GRAY = 246               # fleet view: Working / Stopped / 次级文字
 
 
 def load_config() -> dict:
-    cfg = {"SIDEBAR_W": 35, "COLLAPSE_AT": 70, "RAIL_W": 2}
+    # SHOW_HISTORY=0: 与 fleet view 100% 对齐, 只显示 job 注册表里的会话;
+    # 想看仅存在于本地 transcript 的旧对话时改成 1(它们会并回各自项目组)。
+    cfg = {"SIDEBAR_W": 35, "COLLAPSE_AT": 70, "RAIL_W": 2,
+           "SHOW_HISTORY": 0}
     try:
         with open(os.path.join(STATE_DIR, "config")) as fh:
             for line in fh:
@@ -90,16 +101,32 @@ def trunc(s: str, w: int) -> str:
     return out
 
 
+def trunc_left(s: str, w: int) -> str:
+    """从左截断、保留尾部: 路径的末级目录最有信息量。"""
+    if cell_len(s) <= w:
+        return s
+    out, n = "", 0
+    for c in reversed(s):
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if n + cw > w - 1:
+            break
+        out = c + out
+        n += cw
+    return "…" + out
+
+
 def clean_title(s: str) -> str:
     s = s.strip()
     if s.startswith("<command-name>"):
         end = s.find("</command-name>")
         if end > 0:
-            return s[len("<command-name>"):end].strip()
-    for tag in ("<command-name>", "</command-name>", "<command-message>",
-                "</command-message>", "<command-args>", "</command-args>"):
-        s = s.replace(tag, " ")
-    return " ".join(s.split())
+            s = s[len("<command-name>"):end].strip()
+    else:
+        for tag in ("<command-name>", "</command-name>", "<command-message>",
+                    "</command-message>", "<command-args>", "</command-args>"):
+            s = s.replace(tag, " ")
+    # 转录里可能混进控制字符; 直接写终端会让整个侧栏画面错乱
+    return "".join(c for c in " ".join(s.split()) if c.isprintable())
 
 
 def ago(ms: float, now: float) -> str:
@@ -374,10 +401,13 @@ def _base_title(title: str) -> str:
 
 
 def _group_name(row: dict) -> str:
-    cwd = row.get("cwd") or ""
-    if cwd:
-        return os.path.basename(cwd.rstrip("/")) or row.get("project") or cwd
-    return row.get("project") or "?"
+    """组标题 = 项目路径(与 fleet view 一致), 家目录缩成 ~; 不再是末级目录名。"""
+    cwd = (row.get("cwd") or "").rstrip("/")
+    if cwd == HOME:
+        return "~"
+    if cwd.startswith(HOME + os.sep):
+        return "~" + cwd[len(HOME):]
+    return cwd or row.get("project") or "?"
 
 
 def build_conversations(segments: list, live: dict, ignored: set) -> list:
@@ -513,12 +543,13 @@ def build_rows(segments: list, jobs: list, live: dict, ignored: set) -> list:
         })
 
     history = []
-    for c in convs:
-        if id(c) in represented:
-            continue
-        if c["cwd"] and (c["cwd"], _base_title(c["title"])) in fleet_titles:
-            continue
-        history.append(c)
+    if CFG.get("SHOW_HISTORY"):
+        for c in convs:
+            if id(c) in represented:
+                continue
+            if c["cwd"] and (c["cwd"], _base_title(c["title"])) in fleet_titles:
+                continue
+            history.append(c)
 
     groups = {}
 
@@ -544,17 +575,21 @@ def build_rows(segments: list, jobs: list, live: dict, ignored: set) -> list:
     history_groups = sorted((g for g in groups.values() if g["history"]),
                             key=lambda g: g["history_sort"], reverse=True)
     ordered = []
-    # fleet 区块: 与右栏逐行对齐, 中间不插历史行
-    for g in fleet_groups:
+    seen = set()
+    # 有 fleet 记录的组在前(组序与右栏 fleet view 一致), 纯历史组补在后面。
+    # 同一组内: fleet 行在前, 只有本地 transcript 的历史行在后 —— 不再单独
+    # 辟一个 HISTORY 区块, 否则同一个项目会出现两次。
+    for g in fleet_groups + history_groups:
+        if id(g) in seen:
+            continue
+        seen.add(id(g))
         g["fleet"].sort(key=lambda r: r["created"])
+        g["history"].sort(key=lambda c: c["mtime"], reverse=True)
         for row in g["fleet"]:
             row["_group"] = row["cwd"] or row["project"] or "?"
             row["_gname"] = _group_name(row)
             row["_section"] = "fleet"
             ordered.append(row)
-    # 历史区块: 全部排在 fleet 区块之后
-    for g in history_groups:
-        g["history"].sort(key=lambda c: c["mtime"], reverse=True)
         for c in g["history"]:
             c["_group"] = c["cwd"] or c["project"] or "?"
             c["_gname"] = _group_name(c)
@@ -603,6 +638,405 @@ def save_expanded_width(w: int) -> None:
         pass
 
 
+# ---------------------------------------------------------------- 会话面板池
+# 每个打开过的会话都有自己的面板(隐藏窗口里跑 shannon-host)。切换会话
+# 只是把目标面板 swap 进右栏、当前面板停回后台窗口 —— 进程不动, 正在跑
+# 的任务不会被打断。
+#
+# panes.json: [{pane, ids, root, cwd, name, last, pending?, after?}]
+
+def load_panes() -> list:
+    try:
+        with open(PANES_FILE) as fh:
+            v = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(v, list):
+        return []
+    return [e for e in v if isinstance(e, dict) and e.get("pane")]
+
+
+def save_panes(entries) -> None:
+    try:
+        with open(PANES_FILE, "w") as fh:
+            json.dump(entries, fh)
+    except OSError:
+        pass
+
+
+class PanesStore:
+    """panes.json 的读-改-写临界区(UI 线程与刷新线程共用)。"""
+
+    def __enter__(self):
+        PANE_LOCK.acquire()
+        self.entries = load_panes()
+        return self.entries
+
+    def __exit__(self, *exc):
+        try:
+            save_panes(self.entries)
+        finally:
+            PANE_LOCK.release()
+        return False
+
+
+def all_panes() -> dict:
+    """{pane_id: {"dead": bool, "window": str}} — 本会话所有窗口的面板"""
+    r = tmux("list-panes", "-s", "-t", SESSION, "-F",
+             "#{pane_id}\t#{pane_dead}\t#{window_index}", timeout=1.0)
+    out = {}
+    if r is None or r.returncode != 0:
+        return out
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            out[parts[0]] = {"dead": parts[1] == "1", "window": parts[2]}
+    return out
+
+
+def prune_entries(entries, panes) -> list:
+    return [e for e in entries
+            if e.get("pane") in panes and not panes[e["pane"]]["dead"]]
+
+
+def find_pane_row(row, entries):
+    ids = set(row.get("ids") or [row.get("id", "")])
+    root = row.get("root") or ""
+    for e in entries:
+        if ids & set(e.get("ids") or []):
+            return e
+        if root and e.get("root") == root:
+            return e
+    if str(row.get("id", "")).startswith("ghost:"):
+        for e in entries:
+            if e.get("pending") and e.get("cwd") == row.get("cwd"):
+                return e
+    return None
+
+
+def set_host_pane(pane: str) -> None:
+    try:
+        with open(os.path.join(STATE_DIR, "host-pane"), "w") as fh:
+            fh.write(pane + "\n")
+    except OSError:
+        pass
+
+
+def new_hidden_pane(env_pairs, cwd, name) -> str:
+    """在隐藏窗口里起一个 shannon-host, 返回新面板 id(失败返回空串)。"""
+    bin_dir = os.path.dirname(os.path.abspath(__file__))
+    if not cwd or not os.path.isdir(cwd):
+        cwd = HOME
+    wname = " ".join(str(name or "session").split())[:40] or "session"
+    r = tmux("new-window", "-d", "-t", f"{SESSION}:", "-n", wname,
+             "-c", cwd, "-P", "-F", "#{pane_id}",
+             "env", f"SHANNON_SESSION={SESSION}", *env_pairs,
+             os.path.join(bin_dir, "shannon-host"))
+    if r is None or r.returncode != 0 or not (r.stdout or "").strip():
+        log(f"新建面板失败 rc={getattr(r, 'returncode', 'exc')} "
+            f"err={((r.stderr if r else '') or '').strip()}")
+        return ""
+    return r.stdout.strip().splitlines()[-1]
+
+
+def swap_slot_in(target: str) -> bool:
+    """把 target 面板换进窗口 0 的右栏; 原面板停到 target 原来的窗口。"""
+    current = host_pane_id()
+    panes = all_panes()
+    if not current or current not in panes or panes[current]["dead"]:
+        return False
+    if target == current:
+        return True
+    if target not in panes or panes[target]["dead"]:
+        return False
+    r = tmux("swap-pane", "-d", "-s", target, "-t", current)
+    if r is None or r.returncode != 0:
+        return False
+    set_host_pane(target)
+    mark_activation()           # 给同步线程宽限期, 避免它和这次切换抢写
+    tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
+    return True
+
+
+def evict_parked(live) -> None:
+    """后台挂起的会话多了就回收最久没看的; 正在跑任务的绝不回收。"""
+    current = host_pane_id()
+    with PanesStore() as entries:
+        panes = all_panes()
+        entries[:] = prune_entries(entries, panes)
+        parked = [e for e in entries
+                  if e["pane"] != current
+                  and panes[e["pane"]]["window"] != "0"]
+        if len(parked) <= MAX_PARKED:
+            return
+        busy = {sid for sid, info in live.items()
+                if str(info.get("status") or "").lower()
+                in ("busy", "working", "active", "running")}
+        parked.sort(key=lambda e: e.get("last", 0))
+        drop = set()
+        for e in parked:
+            if len(parked) - len(drop) <= MAX_PARKED:
+                break
+            if busy & set(e.get("ids") or []):
+                continue
+            drop.add(e["pane"])
+        if not drop:
+            return
+        for pid in drop:
+            tmux("kill-pane", "-t", pid)
+        entries[:] = [e for e in entries if e["pane"] not in drop]
+
+
+def bind_pending(rows) -> None:
+    """新建会话的第一条消息落盘后, 把它登记到刚才那块面板上。"""
+    cur_pane = host_pane_id()
+    with PanesStore() as entries:
+        bound = {e.get("row_key") for e in entries if e.get("row_key")}
+        for e in entries:
+            if not e.get("pending"):
+                continue
+            after = e.get("after", 0)
+            cand = [r for r in rows
+                    if r.get("cwd") == e.get("cwd")
+                    and r.get("mtime", 0) >= after - 5000
+                    and r.get("id") not in bound
+                    and not str(r.get("id", "")).startswith("ghost:")]
+            if not cand:
+                continue
+            cand.sort(key=lambda r: r.get("mtime", 0), reverse=True)
+            r = cand[0]
+            e["ids"] = sorted(set(e.get("ids") or [])
+                              | set(r.get("ids") or [r.get("id")]))
+            e["root"] = e.get("root") or r.get("root") or ""
+            e["pending"] = False
+            e["row_key"] = r["id"]
+            bound.add(r["id"])
+            if e["pane"] == cur_pane:
+                set_current_session(r["id"])
+
+
+# ---------------------------------------------------------------- 跟随右栏
+# 右栏是 Claude 自己的界面: 用户可以按 ← 回 fleet view, 再在里面选别的会话。
+# 这时 panes.json 里"这个面板属于哪个会话"就过期了。侧栏必须跟着右侧的
+# 真实状态走, 否则点 A 会显示 B。判据是每个面板里实际运行的 claude 进程:
+#   claude agents        → fleet view(或 fleet 里的某个会话, 看标题)
+#   claude --resume <id> → 该会话
+#   claude attach <short>→ 短 id 对应的后台会话
+#   claude(无参数)       → 从 ~/.claude/sessions/<pid>.json 取 sessionId
+
+LAST_ACTIVATE = [0.0]
+# fleet 列表的底部提示会随输入框状态变化, 两种文案都认
+FLEET_MARKERS = ("enter to open", "space to reply", "ctrl+x to delete",
+                 "enter to create", "esc to clear", "ctrl+f to find",
+                 "describe a task for a new session")
+# 会话界面(区别于 fleet 列表)的底部提示
+CONV_MARKERS = ("auto mode on", "shift+tab to cycle", "esc to interrupt")
+
+
+def mark_activation() -> None:
+    """刚由侧栏切换过: 给同步线程一个宽限期, 别和它抢着写 current-session。"""
+    LAST_ACTIVATE[0] = time.time()
+
+
+def _ps_table() -> dict:
+    """{pid: (ppid, command)} — 一次 ps 拿全进程树"""
+    try:
+        r = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return {}
+    table = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if (len(parts) == 3 and parts[0].isdigit()
+                and parts[1].isdigit()):
+            table[int(parts[0])] = (int(parts[1]), parts[2])
+    return table
+
+
+def _descendants(table, root) -> list:
+    children = {}
+    for pid, (ppid, _cmd) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    out, stack = [], [root]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def _claude_procs(table, pane_pid) -> list:
+    """面板进程树里的 claude 进程 [(pid, argv)]"""
+    procs = []
+    for pid in [pane_pid] + _descendants(table, pane_pid):
+        cmd = table.get(pid, (0, ""))[1]
+        argv = cmd.split()
+        if not argv:
+            continue
+        base = os.path.basename(argv[0])
+        if base in ("claude", "claude.exe") or "claude-code/bin/claude" in argv[0]:
+            procs.append((pid, argv))
+    return procs
+
+
+def classify_pane(procs) -> tuple:
+    """("attach", short) | ("resume", uuid) | ("agents", "") |
+       ("plain", pid) | ("none", "")"""
+    for _pid, argv in procs:
+        for i, a in enumerate(argv[1:], 1):
+            if a == "attach" and i + 1 < len(argv):
+                return ("attach", argv[i + 1])
+            if a == "--resume" and i + 1 < len(argv):
+                return ("resume", argv[i + 1])
+            if a == "agents":
+                return ("agents", "")
+    if procs:
+        return ("plain", str(procs[0][0]))
+    return ("none", "")
+
+
+def _session_file_sid(pid: int) -> str:
+    try:
+        with open(os.path.join(HOME, ".claude", "sessions",
+                               f"{pid}.json")) as fh:
+            d = json.load(fh)
+        return str(d.get("sessionId") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _pane_screen(pane: str):
+    r = tmux("capture-pane", "-p", "-t", pane, timeout=1.0)
+    if r is None or r.returncode != 0:
+        return None
+    return r.stdout or ""
+
+
+def _screen_is_fleet_list(text) -> bool:
+    if text is None:
+        return True             # 取不到就按列表处理: 宁可不高亮, 不要绑错
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    head = "\n".join(lines[:6])
+    tail = "\n".join(lines[-8:])
+    if "New sessions:" in head or "awaiting input" in head:
+        return True             # fleet 列表顶部的固定头部
+    if any(m in tail for m in FLEET_MARKERS):
+        return True
+    if any(m in tail for m in CONV_MARKERS):
+        return False            # 明确是会话界面
+    return True                 # 认不出来: 按列表处理, 绝不猜成某个会话
+
+
+def _pane_shows_fleet_list(pane: str) -> bool:
+    return _screen_is_fleet_list(_pane_screen(pane))
+
+
+def _sid_from_short(rows, short: str) -> str:
+    """attach 的短 id 是会话 uuid 的前 8 位。"""
+    if not short:
+        return ""
+    for r in rows:
+        for sid in (r.get("ids") or ()):
+            if str(sid).startswith(short):
+                return str(sid)
+    return ""
+
+
+def _visible_pane_shows(row) -> bool:
+    """可见右栏此刻是否真的在显示这一行。
+
+    右栏可能刚被 ← 或 fleet view 里的选择改过, 而同步线程还没跑到;
+    点击时再验一次, 避免"记录说在这里"其实不是。"""
+    pane = host_pane_id()
+    if not pane:
+        return False
+    r = tmux("display-message", "-p", "-t", pane, "#{pane_pid}",
+             timeout=1.0)
+    try:
+        pid = int((r.stdout or "").strip())
+    except (AttributeError, ValueError):
+        return True                 # 查不到: 维持原判断, 不做额外切换
+    kind, val = classify_pane(_claude_procs(_ps_table(), pid))
+    if kind == "none":
+        return False
+    screen = _pane_screen(pane)
+    if screen is None:
+        return True                 # 读不到画面: 不擅自切换
+    if _screen_is_fleet_list(screen):
+        return False
+    ids = set(row.get("ids") or [row.get("id", "")])
+    if kind == "resume":
+        return val in ids
+    if kind == "attach":
+        return any(str(s).startswith(val) for s in ids if val)
+    if kind == "plain":
+        return _session_file_sid(int(val)) in ids
+    if kind == "agents":
+        t = _pane_title(pane).lstrip("·✢✳✶✻✽ ").strip()
+        return bool(t) and _base_title(t) == _base_title(row.get("title", ""))
+    return False
+
+
+def _bind_visible(row) -> None:
+    """把可见面板登记到这一行(同步线程还没来得及跑时用)。"""
+    pane = host_pane_id()
+    if not pane or str(row.get("id", "")).startswith("ghost:"):
+        return
+    ids = sorted(set(row.get("ids") or [row["id"]]))
+    with PanesStore() as entries:
+        e = next((x for x in entries if x.get("pane") == pane), None)
+        if e is None:
+            entries.append({"pane": pane, "ids": ids,
+                            "root": row.get("root") or "",
+                            "cwd": row.get("cwd") or "",
+                            "name": row.get("title") or "session",
+                            "last": time.time()})
+        elif not (set(ids) & set(e.get("ids") or [])):
+            e.update({"ids": ids, "root": row.get("root") or "",
+                      "cwd": row.get("cwd") or e.get("cwd", ""),
+                      "last": time.time()})
+
+
+def _unbind_host_for(row) -> None:
+    """可见面板已经不在显示这一行: 只解除这一行的过期绑定,
+    不要殃及面板上可能属于另一个会话的绑定。"""
+    pane = host_pane_id()
+    ids = set(row.get("ids") or [row.get("id", "")])
+    with PanesStore() as entries:
+        entries[:] = [e for e in entries
+                      if not (e.get("pane") == pane
+                              and ids & set(e.get("ids") or []))]
+
+
+def _pane_title(pane: str) -> str:
+    r = tmux("display-message", "-p", "-t", pane, "#{pane_title}",
+             timeout=1.0)
+    return (r.stdout or "").strip() if r else ""
+
+
+def _row_by_sid(rows, sid: str):
+    if not sid:
+        return None
+    for r in rows:
+        if sid in (r.get("ids") or ()) or sid in (r.get("id"),
+                                                   r.get("live_id")):
+            return r
+    return None
+
+
+def _row_by_title(rows, title: str):
+    t = title.lstrip("·✢✳✶✻✽ ").strip()
+    if not t:
+        return None
+    exact = [r for r in rows if r.get("title") == t]
+    if len(exact) == 1:
+        return exact[0]
+    base = _base_title(t)
+    near = [r for r in rows if _base_title(r.get("title", "")) == base]
+    return near[0] if len(near) == 1 else None
+
+
 def load_ignored() -> set:
     """用户手动隐藏的会话 id(按 x)"""
     try:
@@ -636,7 +1070,8 @@ def expanded_width() -> int:
 
 
 def window_width() -> str:
-    r = tmux("display-message", "-p", "-t", f"{SESSION}:0", "#{window_width}")
+    r = tmux("display-message", "-p", "-t", f"{SESSION}:0", "#{window_width}",
+             timeout=1.0)
     return r.stdout.strip() if r else ""
 
 
@@ -662,7 +1097,7 @@ def live_status() -> dict:
     try:
         out = subprocess.run(
             ["claude", "agents", "--json"],
-            capture_output=True, text=True, timeout=8,
+            capture_output=True, text=True, timeout=4,
         ).stdout
         arr = json.loads(out)
     except Exception:
@@ -751,58 +1186,97 @@ HOVER_FG = {"accent": 5, "green": 8, "yellow": 9, "red": 10,
 
 # ---------------------------------------------------------------- 操作
 
-def tmux(*args):
+def tmux(*args, timeout=3.0):
+    """tmux 调用一律带短超时: server 卡住时宁可失败, 也不要把 UI 冻住。"""
     try:
         return subprocess.run(
-            ["tmux", *args], capture_output=True, text=True, timeout=8)
+            ["tmux", *args], capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
 
 
 def activate(row):
-    """点击某个会话: 右栏就地加载。
+    """点击某个会话: 右栏就地加载, 但绝不杀死正在运行的会话进程。
 
-    会话身份优先用活着的 worker(attach, 不复制); 只有在没有活 worker
-    时才 --resume 一个历史分段。--resume 默认复用原 session id,
-    不加 --fork-session, 所以从这里打开会话永远不会再造出副本。"""
+    打开过的会话各自有一块隐藏窗口里的面板; 切换只是 swap-pane 把目标
+    面板换进右栏、当前面板停到后台 —— 任务继续跑, 回来时还在原进度上。
+    只有第一次打开某个会话时才新建进程。"""
     pane = host_pane_id()
     if not pane:
         return "找不到宿主面板"
-    if row["id"].startswith("ghost:"):
+    ghost_row = str(row.get("id", "")).startswith("ghost:")
+    if not ghost_row:
+        # 先相信右栏的真实画面: 用户可能刚在 fleet view 里打开了它
+        if _visible_pane_shows(row):
+            set_current_session(row["id"])
+            _bind_visible(row)
+            return "已经在这里了"
+        if current_session_id() in row.get("ids", (row["id"],)):
+            # 记录说"在这里", 但右栏已经不在显示它(按过 ← / 换了会话):
+            # 解除这一行的过期绑定, 继续走正常切换流程
+            _unbind_host_for(row)
+
+    with PanesStore() as entries:
+        panes = all_panes()
+        entries[:] = prune_entries(entries, panes)
+        entry = find_pane_row(row, entries)
+        if entry:
+            entry["last"] = time.time()   # 防止刷新线程把它当最久未看回收
+
+    if ghost_row and not entry:
         return "会话启动中, 马上就好"
-    if current_session_id() in row.get("ids", (row["id"],)):
-        return "已经在这里了"
-    bin_dir = os.path.dirname(os.path.abspath(__file__))
-    live = live_status()
-    # 行里所有活着的 worker; 可 attach 的优先, 同档再比"热"度
-    live_ids = [sid for sid in row.get("ids", ()) if sid in live]
-    live_ids.sort(key=lambda sid: (bool(live[sid].get("attachable")),
-                                   live_rank(live[sid])), reverse=True)
-    name = os.path.basename(row["cwd"].rstrip("/")) or row["project"]
-    for sid in live_ids:
-        info = live[sid]
-        short = info.get("short") if info.get("attachable") else ""
-        if not short:
-            continue
-        # attach 用短 id(完整 uuid 匹配不到 job); 同时带上会话 id,
-        # 万一接管失败, shannon-host 会退回 --resume 同一会话。
-        r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
-                 "env", f"SHANNON_DIR={row['cwd']}",
-                 f"SHANNON_ATTACH={short}",
-                 f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
-        if r is not None and r.returncode == 0:
-            set_current_session(sid)
-            return f"已接管后台会话: {name}"
-        return "接管失败"
-    if any(live[sid].get("kind") == "interactive" for sid in live_ids):
-        return "该会话正在其他终端运行"
-    r = tmux("respawn-pane", "-k", "-t", pane, "-c", row["cwd"],
-             "env", f"SHANNON_DIR={row['cwd']}",
-             f"SHANNON_RESUME={row['id']}", f"{bin_dir}/shannon-host")
-    if r is not None and r.returncode == 0:
-        set_current_session(row["id"])
-        return f"已切换到 {name}"
-    return "切换失败"
+
+    name = (os.path.basename((row.get("cwd") or "").rstrip("/"))
+            or row.get("project") or "session")
+    attach_short = ""
+    cur = "" if ghost_row else row["id"]
+    if entry:
+        target = entry["pane"]
+        if target == pane:
+            return "已经在这里了"
+    else:
+        live = live_status()
+        # 行里所有活着的 worker; 可 attach 的优先, 同档再比"热"度
+        live_ids = [sid for sid in row.get("ids", ()) if sid in live]
+        live_ids.sort(key=lambda sid: (bool(live[sid].get("attachable")),
+                                       live_rank(live[sid])), reverse=True)
+        attach_short = next(
+            (live[sid]["short"] for sid in live_ids
+             if live[sid].get("attachable") and live[sid].get("short")), "")
+        if not attach_short and any(
+                live[sid].get("kind") == "interactive" for sid in live_ids):
+            return "该会话正在其他终端运行"
+        cwd = row.get("cwd") or ""
+        env = [f"SHANNON_DIR={cwd}"]
+        if attach_short:
+            # attach 用短 id(完整 uuid 匹配不到 job); 同时带上会话 id,
+            # 万一接管失败, shannon-host 会退回 --resume 同一会话。
+            env += [f"SHANNON_ATTACH={attach_short}",
+                    f"SHANNON_RESUME={row['id']}"]
+            cur = next(sid for sid in live_ids
+                       if live[sid].get("short") == attach_short)
+        else:
+            env += [f"SHANNON_RESUME={row['id']}"]
+        target = new_hidden_pane(env, cwd, name)
+        if not target:
+            return "切换失败"
+        with PanesStore() as entries:
+            entries.append({
+                "pane": target,
+                "ids": sorted(set(row.get("ids") or [row["id"]])),
+                "root": row.get("root") or "",
+                "cwd": cwd,
+                "name": name,
+                "last": time.time(),
+            })
+        evict_parked(live)
+
+    if not swap_slot_in(target):
+        return "切换失败"
+    set_current_session(cur)
+    if attach_short:
+        return f"已接管后台会话: {name}"
+    return f"已切换到 {name}"
 
 
 # ---------------------------------------------------------------- 界面
@@ -818,19 +1292,25 @@ class App:
         self.ghost = None            # 刚新建、transcript 尚未落盘的占位会话
         self.wake = threading.Event()
         threading.Thread(target=self.refresh_loop, daemon=True).start()
+        threading.Thread(target=self.sync_loop, daemon=True).start()
 
-        self.sel = 0            # 焦点行在 display 行里的序号
+        self.sel = 0            # 焦点条目序号(组标题和会话行都可选)
         self.focus_visible = True
+        self.focus_ts = 0.0     # 键盘高亮出现时间(5 秒后自动消失)
         self.offset = 0         # 滚动
+        self.collapsed = set()  # 折叠的项目组 key
         self.rail = False       # rail 模式(收窄成细条)
         self.picking = False    # 新建会话: 正在选择项目
         self.psel = 0           # picking 模式的焦点序号
+        self.poff = 0           # picking 模式的滚动偏移
         self.proj_list = []     # picking 模式的项目列表 [(cwd, name)]
         self.entry_mode = False  # 正在输入全新路径
         self.entry_buf = ""     # 路径输入缓冲
         self.hover = None       # ('row', idx) | ('collapse',) | ('exit',) | ('new',) | ('rail',)
         self.msg = ""
         self.msg_until = 0.0
+        self.suppress_click_until = 0.0   # 刚离开选择器/输入态时吞掉余下的鼠标事件
+        self.exit_armed = 0.0             # 退出按钮二次确认的有效期
         self.footer_btn_x = -1
         self.exit_zone = None   # ✕ 退出 的点击范围
         self.new_zone = None    # ＋ 新建 的点击范围
@@ -840,6 +1320,7 @@ class App:
         self.started_at = time.time()
         self.consec_err = 0
         self.last_fix = 0.0
+        self.last_guard = 0.0    # 布局守卫节流(别每拍都 spawn tmux)
         self.last_act = 0.0     # 点击动作防抖
         self.last_motion = 0.0
         self.last_saved_w = 0
@@ -864,6 +1345,8 @@ class App:
             jobs = scan_jobs()
             live = live_status()
             rows = build_rows(segments, jobs, live, load_ignored())
+            bind_pending(rows)      # 新会话落盘后认领它的后台面板
+            evict_parked(live)      # 后台面板太多时回收最久没看的
             ghost = self.ghost
             if ghost:
                 # 新会话的 transcript 落盘后, 占位行功成身退
@@ -873,20 +1356,34 @@ class App:
                 if real or time.time() > (ghost["mtime"] + 300000) / 1000:
                     self.ghost = None
                 else:
-                    # 插进它所属项目组的末尾(不打断 fleet 的组顺序);
-                    # 全新项目则放在 fleet 区块末尾。
+                    # 插进它所属项目组里最后一个 fleet 行之后(不打断组内历史行);
+                    # 全新项目则放在最后一个含 fleet 的组之后。
                     key = ghost.get("_group") or ghost["cwd"]
-                    insert_at = None
-                    for i, r in enumerate(rows):
-                        if (r.get("_section") or "fleet") != "fleet":
-                            break
-                        if (r.get("_group") or r.get("cwd")) == key:
-                            insert_at = i + 1
-                    if insert_at is None:
-                        insert_at = next(
-                            (i for i, r in enumerate(rows)
-                             if (r.get("_section") or "fleet") != "fleet"),
-                            len(rows))
+
+                    def gkey(r):
+                        return r.get("_group") or r.get("cwd")
+
+                    def is_fleet(r):
+                        return (r.get("_section") or "fleet") == "fleet"
+
+                    in_group = [i for i, r in enumerate(rows)
+                                if gkey(r) == key]
+                    if in_group:
+                        fleet_here = [i for i in in_group if is_fleet(rows[i])]
+                        insert_at = (max(fleet_here) + 1 if fleet_here
+                                     else in_group[0])
+                    else:
+                        last_fleet = max(
+                            (i for i, r in enumerate(rows) if is_fleet(r)),
+                            default=-1)
+                        if last_fleet < 0:
+                            insert_at = 0
+                        else:
+                            g = gkey(rows[last_fleet])
+                            insert_at = last_fleet + 1
+                            while (insert_at < len(rows)
+                                   and gkey(rows[insert_at]) == g):
+                                insert_at += 1
                     rows.insert(insert_at, dict(ghost))
             with self.lock:
                 self.rows = rows
@@ -896,44 +1393,157 @@ class App:
             if self.wake.wait(REFRESH_SECS):
                 self.wake.clear()
 
+    # -- 跟随右栏 -----------------------------------------------------
+    def sync_loop(self):
+        while not self.stop.is_set():
+            try:
+                if time.time() - LAST_ACTIVATE[0] > 2.5:
+                    self.sync_panes()
+            except Exception:
+                import traceback
+                log("sync 异常:\n" + traceback.format_exc())
+            self.stop.wait(1.5)
+
+    def sync_panes(self):
+        """以右栏真实进程为准, 校正 current-session 与 panes.json。
+
+        用户在右栏按 ← 回 fleet view、再在里面选别的会话时, 侧栏原来的
+        "面板 ↔ 会话"绑定就错了。这里按每个面板里实际运行的 claude 进程
+        重新绑定; 认不出来就解除绑定, 宁可让用户重新点一次, 也不能点 A 显示 B。"""
+        rows, live, ready, _ = self.snapshot()
+        if not ready:
+            return
+        r = tmux("list-panes", "-s", "-t", SESSION, "-F",
+                 "#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_current_path}",
+                 timeout=1.0)
+        if r is None or r.returncode != 0:
+            return
+        panes = {}
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4 or parts[2] == "1":
+                continue
+            panes[parts[0]] = {
+                "pid": int(parts[1]) if parts[1].isdigit() else 0,
+                "cwd": parts[3],
+            }
+        if not panes:
+            return
+        visible = host_pane_id()
+        table = _ps_table()
+
+        states = {}
+        for pane, meta in panes.items():
+            procs = _claude_procs(table, meta["pid"])
+            kind, val = classify_pane(procs)
+            sid = ""
+            if kind != "none":
+                screen = _pane_screen(pane)
+                if screen is None:
+                    continue        # 画面读不到: 本轮不动这个面板
+                if not _screen_is_fleet_list(screen):
+                    if kind == "attach":
+                        sid = _sid_from_short(rows, val)
+                    elif kind == "resume":
+                        sid = val
+                    elif kind == "plain":
+                        sid = _session_file_sid(int(val))
+                    elif kind == "agents":
+                        row = _row_by_title(rows, _pane_title(pane))
+                        sid = row["id"] if row else ""
+            states[pane] = (kind, sid, meta["cwd"])
+
+        changed = False
+        cur = current_session_id()
+        want_cur = cur
+        with PANE_LOCK:
+            entries = [e for e in load_panes() if e.get("pane") in panes]
+            by_pane = {e["pane"]: e for e in entries}
+            for pane, (kind, sid, cwd) in states.items():
+                entry = by_pane.get(pane)
+                # 面板刚创建、claude 还没起来: 别急着清掉它
+                starting = (entry is not None
+                            and time.time() - entry.get("last", 0) < 8
+                            and kind in ("none", "plain") and not sid)
+                if starting:
+                    continue
+                if sid:
+                    row = _row_by_sid(rows, sid)
+                    ids = (sorted(set(row.get("ids") or [sid]))
+                           if row else [sid])
+                    if entry is None:
+                        entry = {"pane": pane, "ids": ids,
+                                 "root": (row or {}).get("root", ""),
+                                 "cwd": (row or {}).get("cwd") or cwd,
+                                 "name": (row or {}).get("title") or "session",
+                                 "last": time.time()}
+                        entries.append(entry)
+                        by_pane[pane] = entry
+                        changed = True
+                    elif not set(ids) & set(entry.get("ids") or []):
+                        entry["ids"] = ids
+                        entry["root"] = (row or {}).get("root", "")
+                        if row and row.get("cwd"):
+                            entry["cwd"] = row["cwd"]
+                        changed = True
+                    if pane == visible:
+                        want_cur = row["id"] if row else sid
+                else:
+                    if entry is not None:
+                        entries.remove(entry)
+                        by_pane.pop(pane, None)
+                        changed = True
+                    if pane == visible:
+                        want_cur = "fleet"   # 列表/空闲: 不属于任何会话
+            if want_cur != cur:
+                set_current_session(want_cur)
+                changed = True
+                log(f"sync: current {cur!r} -> {want_cur!r} "
+                    f"(visible={visible})")
+            if changed:
+                save_panes(entries)
+        if changed:
+            with self.lock:
+                self.version += 1
+
     def snapshot(self):
         with self.lock:
             return self.rows, self.live, self.ready, self.version
 
     # -- 展示模型 -----------------------------------------------------
     def display_items(self, rows):
-        """[('group', name) | ('row', row)] — 顺序完全沿用 rows。
+        """[('group', {key,name}) | ('row', row)] — 顺序完全沿用 rows。
 
-        rows 已由 build_rows 按 fleet view 的组顺序/组内顺序排好;
-        这里只负责插入项目标题、按组限量, 不再重新排序。"""
+        rows 已由 build_rows 按 fleet view 的组顺序/组内顺序排好, 同一项目
+        只会出现一次(fleet 行 + 本地历史行); 这里只插入项目标题、按组限量,
+        并跳过被用户折叠的项目。"""
         items = []
         current = None
-        section = None
-        history_marker = False
-        has_fleet = any((r.get("_section") or "fleet") == "fleet" for r in rows)
         groups = 0
         count = 0
         for r in rows:
             key = r.get("_group") or r.get("cwd") or r.get("project")
-            this_section = r.get("_section") or "fleet"
-            if this_section != section:
-                section = this_section
-                current = None          # 强制为新 section 出组标题
             if key != current:
                 if groups >= MAX_GROUPS:
                     break
-                if section == "history" and has_fleet and not history_marker:
-                    items.append(("group", "HISTORY"))
-                    history_marker = True
                 current = key
                 groups += 1
                 count = 0
-                items.append(("group", r.get("_gname") or key))
+                items.append(("group", {"key": key,
+                                        "name": r.get("_gname") or key}))
+            if key in self.collapsed:
+                continue
             if count >= PER_GROUP:
                 continue
             count += 1
             items.append(("row", r))
         return items
+
+    def toggle_group(self, key) -> None:
+        if key in self.collapsed:
+            self.collapsed.discard(key)
+        else:
+            self.collapsed.add(key)
 
     # -- 绘制 ---------------------------------------------------------
     def draw(self, stdscr):
@@ -963,47 +1573,74 @@ class App:
         self.rail = False
 
         items = self.display_items(rows)
-        row_idx = [i for i, it in enumerate(items) if it[0] == "row"]
-        self.sel = max(0, min(self.sel, len(row_idx) - 1))
-        view_rows = max(1, H - 2)
+        self.sel = max(0, min(self.sel, len(items) - 1))
+        n_rows = sum(1 for it in items if it[0] == "row")
         cur = current_session_id()
 
-        # 滚动: 焦点行保持可见
-        if row_idx and self.focus_visible:
-            sel_item = row_idx[self.sel]
+        # 每个条目占 1 行; 组与组之间另加一个空行(与 fleet view 一致)
+        view_rows = max(1, H - 3)     # 可用内容行: y=2 .. H-2
+
+        def item_h(idx):
+            if items[idx][0] == "row":
+                return 1
+            return 2 if idx > self.offset else 1   # 组标题前有一个空行
+
+        # 滚动: 焦点条目保持可见(按实际占用行数算)
+        if items and self.focus_visible:
+            sel_item = self.sel
             if sel_item < self.offset:
                 self.offset = sel_item
-            while (sel_item >= self.offset + view_rows
-                   and self.offset < len(items)):
+            while (self.offset < sel_item
+                   and sum(item_h(k)
+                           for k in range(self.offset, sel_item + 1))
+                   > view_rows):
                 self.offset += 1
 
         stdscr.erase()
         self.row_at = {}
 
-        # 头部: SESSIONS 带灰色底带,与项目名明确区分
+        # 头部: 珊瑚色小 logo + SESSIONS 灰底带(与 fleet view 对齐)
         band = curses.color_pair(12) | curses.A_BOLD
-        stdscr.addnstr(0, 1, "SESSIONS", W - 2, band)
-        if W > 9:
-            stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
-        if row_idx:
-            cnt = str(len(row_idx))
+        stdscr.addnstr(0, 0, " " * max(0, W - 1), max(0, W - 1), band)
+        x = 1
+        if W >= 26:
+            logo = "▐▛███▛█"
+            stdscr.addnstr(0, 1, logo, cell_len(logo),
+                           curses.color_pair(15) | curses.A_BOLD)
+            x = 1 + cell_len(logo) + 1
+        stdscr.addnstr(0, x, "SESSIONS", max(1, W - x), band)
+        if n_rows:
+            cnt = str(n_rows)
             stdscr.addnstr(0, max(2, W - 1 - cell_len(cnt)), cnt, W - 2, band)
 
-        # 列表
-        y = 1
+        # 列表: 头部下留一个空行; 同一项目内会话紧挨着, 组与组之间空一行
+        y = 2
         for i in range(self.offset, len(items)):
+            kind, payload = items[i]
+            if kind == "group" and y > 2:
+                y += 1                   # 组前空行(第一组上方已经有了)
             if y > H - 2:
                 break
-            kind, payload = items[i]
+            cursor = self.focus_visible and self.sel == i
+            hovered = self.hover == ("row", i)
+            if cursor:                   # 焦点整行底色带(组标题与会话行一致)
+                stdscr.addnstr(y, 0, " " * max(0, W - 1),
+                               max(0, W - 1), curses.color_pair(13))
             if kind == "group":
-                stdscr.addnstr(y, 1, payload, W - 2,
-                               curses.color_pair(2) | curses.A_BOLD)
+                collapsed = payload["key"] in self.collapsed
+                name = ("▸ " if collapsed else "") + payload["name"]
+                if cursor:
+                    attr = curses.color_pair(13) | curses.A_BOLD
+                elif hovered:
+                    attr = curses.color_pair(26) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(2) | curses.A_BOLD
+                stdscr.addnstr(y, 1, trunc_left(name, max(1, W - 2)),
+                               W - 2, attr)
+                self.row_at[y] = i
+                y += 1
             else:
                 row = payload
-                cursor = (self.focus_visible
-                          and self.sel < len(row_idx)
-                          and row_idx[self.sel] == i)
-                hovered = self.hover == ("row", i)
                 current = bool(cur) and cur in row.get("ids", (row["id"],))
                 t = ago(row["mtime"], now_ms)
                 gch, gkind = status_glyph(row, live)
@@ -1039,7 +1676,7 @@ class App:
                 stdscr.addnstr(y, x_title, title, W - x_title, a_title)
                 stdscr.addnstr(y, x_time, t, W - 2, a_time)
                 self.row_at[y] = i
-            y += 1
+                y += 1
 
         if not ready:
             stdscr.addnstr(1, 1, "loading…", W - 2, curses.color_pair(3))
@@ -1054,8 +1691,10 @@ class App:
         self.new_zone = (1 + cell_len("✕ 退出 · "), cell_len("✕ 退出 · ＋ 新建"))
         hover_exit = self.hover == ("exit",)
         hover_new = self.hover == ("new",)
+        exit_armed = time.time() < self.exit_armed
         stdscr.addnstr(H - 1, 1, "✕ 退出", W - 2,
-                       curses.color_pair(26 if hover_exit else 3))
+                       curses.color_pair(10 if exit_armed else
+                                         (26 if hover_exit else 3)))
         stdscr.addnstr(H - 1, 7, " · ", W - 7, curses.color_pair(3))
         stdscr.addnstr(H - 1, 10, "＋ 新建", W - 10,
                        curses.color_pair(26 if hover_new else 3))
@@ -1070,6 +1709,13 @@ class App:
             stdscr.addnstr(H - 1, self.footer_btn_x + 1, " 收起",
                            W - self.footer_btn_x - 1, curses.color_pair(3))
 
+        # toast: 操作反馈临时覆盖底栏(2.5 秒)
+        if self.msg and time.time() < self.msg_until:
+            stdscr.addnstr(H - 1, 1, " " * max(0, W - 2), W - 2,
+                           curses.color_pair(1))
+            stdscr.addnstr(H - 1, 1, trunc(self.msg, W - 3), W - 2,
+                           curses.color_pair(5) | curses.A_BOLD)
+
         stdscr.refresh()
 
     def toast(self, m):
@@ -1078,50 +1724,80 @@ class App:
         self.last_version = -1          # 立即重画,让 toast 马上可见
 
     # -- 交互 ---------------------------------------------------------
-    def move(self, row_idx, delta):
-        if not row_idx:
+    def move(self, items, delta):
+        if not items:
             return
         self.focus_visible = True       # 上下键从当前焦点出发重新显示高亮
-        self.sel = max(0, min(len(row_idx) - 1, self.sel + delta))
+        self.focus_ts = time.time()     # 5 秒后自动消失
+        self.sel = max(0, min(len(items) - 1, self.sel + delta))
 
-    def open_selected(self, items, row_idx):
-        if not row_idx or self.sel >= len(row_idx):
+    def scroll(self, delta, items, H):
+        """滚轮: 只滚可视区, 不滚出列表末尾的空白。"""
+        view = max(1, H - 2)
+        self.offset = max(0, min(self.offset + delta,
+                                 max(0, len(items) - view)))
+
+    def open_selected(self, items):
+        """回车: 组标题 → 展开/折叠; 会话行 → 打开。"""
+        if not items or self.sel >= len(items):
             return
-        self.toast(activate(items[row_idx[self.sel]][1]))
+        kind, payload = items[self.sel]
+        if kind == "group":
+            self.toggle_group(payload["key"])
+            self.focus_visible = True
+            self.focus_ts = time.time()
+            return
+        self.toast(activate(payload))
 
-    def click(self, my, mx, H, items, row_idx):
+    def click(self, my, mx, H, items):
+        if time.time() < self.suppress_click_until:
+            return                      # 刚关闭选择器/输入态, 忽略余下的点击
         if self.rail:
             self.act(lambda: subprocess.run([TOGGLE]))   # rail 点击 → 展开
             return
         if my == H - 1:
             # 底部按钮区: ✕ 退出 · ＋ 新建 · ◀ 收起(命中区放宽一格)
             if (self.exit_zone and self.exit_zone[0] <= mx <= self.exit_zone[1]):
-                self.act(self.quit_session)
+                now = time.time()
+                if now < self.exit_armed:
+                    self.act(self.quit_session)
+                else:
+                    self.exit_armed = now + 3.0
+                    self.toast("再点一次确认退出")
             elif (self.new_zone and self.new_zone[0] <= mx <= self.new_zone[1]):
                 self.picking = True
                 self.psel = 0
+                self.poff = 0
             elif mx >= self.footer_btn_x - 1:
                 self.act(lambda: subprocess.run([TOGGLE]))
             return
         if my in self.row_at:
             idx = self.row_at[my]
-            if idx < len(items) and items[idx][0] == "row":
-                def open_row():
-                    if idx in row_idx:
-                        self.sel = row_idx.index(idx)   # 焦点跟随点击行
-                    self.toast(activate(items[idx][1]))
-                self.act(open_row)
+            if 0 <= idx < len(items):
+                kind, payload = items[idx]
+
+                def act_item():
+                    self.sel = idx
+                    if kind == "group":
+                        # 与 fleet view 一致: 点击项目路径 → 展开/折叠
+                        self.focus_visible = True
+                        self.focus_ts = time.time()
+                        self.toggle_group(payload["key"])
+                    else:
+                        self.toast(activate(payload))
+                self.act(act_item)
 
     def right_pane_alive(self):
         pane = host_pane_id()
         if not pane:
             return True
-        r = tmux("list-panes", "-t", f"{SESSION}:0", "-F", "#{pane_id}")
-        ids = (r.stdout or "").split() if r else []
-        alive = r is None or pane in ids
+        panes = all_panes()          # 含后台窗口: 面板停在那儿也算活着
+        if not panes:
+            return True              # tmux 查询失败: 宁可不动, 不误杀整个工作区
+        info = panes.get(pane)
+        alive = info is not None and not info["dead"]
         if not alive:
-            log(f"宿主面板消失判定: host-pane={pane} list-panes={ids} "
-                f"rc={r.returncode if r else 'exc'}")
+            log(f"宿主面板消失判定: host-pane={pane} panes={panes}")
         return alive
 
     def run(self, stdscr):
@@ -1130,23 +1806,50 @@ class App:
         stdscr.timeout(120)
         self.base_timeout = 120
         curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, -1, -1)
-        curses.init_pair(2, GRAY, -1)    # 项目标题(对齐 fleet 的 246 灰)
-        curses.init_pair(3, GRAY, -1)    # 时间/次级文字/灰状态点
-        curses.init_pair(4, 250, -1)
-        curses.init_pair(5, ACCENT, -1)
-        curses.init_pair(8, GREEN, -1)
-        curses.init_pair(9, YELLOW, -1)
-        curses.init_pair(10, RED, -1)
-        curses.init_pair(12, 250, 236)   # SESSIONS 底色带
-        curses.init_pair(13, 255, 236)   # 焦点行: 标题
-        curses.init_pair(14, 240, 236)   # 焦点行: 时间/暗色
-        curses.init_pair(15, ACCENT, 236)
-        curses.init_pair(16, GREEN, 236)
-        curses.init_pair(17, YELLOW, 236)
-        curses.init_pair(18, RED, 236)
-        curses.init_pair(26, 255, -1)    # 悬停行: 文字提亮
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        # 8/16 色终端(TERM=xterm 等)承载不了 256 色号: 近似到基础色,
+        # 并且不让 init_pair 抛错把整个侧栏带走。
+        colors = getattr(curses, "COLORS", 8) or 8
+        low = colors < 256
+
+        def fg(c):
+            if c < 0 or not low:
+                return c
+            return {ACCENT: curses.COLOR_RED, GREEN: curses.COLOR_GREEN,
+                    YELLOW: curses.COLOR_YELLOW, RED: curses.COLOR_RED}.get(
+                        c, curses.COLOR_WHITE)
+
+        def bg(c):
+            if c < 0 or not low:
+                return c
+            return curses.COLOR_BLACK
+
+        def pair(n, f, b=-1):
+            try:
+                curses.init_pair(n, fg(f), bg(b))
+            except curses.error:
+                pass
+
+        pair(1, -1, -1)
+        pair(2, GRAY, -1)    # 项目标题(对齐 fleet 的 246 灰)
+        pair(3, GRAY, -1)    # 时间/次级文字/灰状态点
+        pair(4, 250, -1)
+        pair(5, ACCENT, -1)
+        pair(8, GREEN, -1)
+        pair(9, YELLOW, -1)
+        pair(10, RED, -1)
+        pair(12, 250, 236)   # SESSIONS 底色带
+        pair(13, 255, 236)   # 焦点行: 标题
+        pair(14, 240, 236)   # 焦点行: 时间/暗色
+        pair(15, ACCENT, 236)
+        pair(16, GREEN, 236)
+        pair(17, YELLOW, 236)
+        pair(18, RED, 236)
+        pair(22, 216, -1)    # 当前会话 + 悬停: 亮珊瑚(之前未初始化, 文字会消失)
+        pair(26, 255, -1)    # 悬停行: 文字提亮
         try:
             curses.mouseinterval(0)   # 点击改用 PRESSED 上报, motion 即时生效
         except curses.error:
@@ -1180,7 +1883,7 @@ class App:
     def main_pane_width(self) -> int:
         """tmux 里的 main-pane-width 选项值(布局的唯一事实源)"""
         r = tmux("show-window-option", "-v", "-t", f"{SESSION}:0",
-                 "main-pane-width")
+                 "main-pane-width", timeout=1.0)
         try:
             return int(r.stdout.strip())
         except (ValueError, AttributeError, TypeError):
@@ -1201,6 +1904,8 @@ class App:
         if W == opt:
             return
         ww = window_width()
+        if not ww:
+            return                 # tmux 查询失败: 不据此判定, 更不能改宽度
         if ww != self.last_ww:
             self.last_ww = ww
             self.ww_changed_at = time.time()
@@ -1223,12 +1928,13 @@ class App:
              "main-pane-width", str(opt))
         tmux("select-layout", "-t", f"{SESSION}:0", "main-vertical")
         p = sidebar_pane_id()
-        cw = tmux("display-message", "-p", "-t", p, '#{pane_width}')
+        cw = tmux("display-message", "-p", "-t", p, '#{pane_width}',
+                  timeout=1.0)
         if cw and cw.stdout.strip() != str(opt):
             tmux("resize-pane", "-t", p, "-x", str(opt))
 
 
-    def handle_escape(self, stdscr, items, row_idx):
+    def handle_escape(self, stdscr, items):
         """解码 SGR 鼠标序列 \x1b[<b;x;yM/m (ncurses 不认, 需自制解析)。
         b: 0=左键按下 1=左键抬起 64/65=滚轮 32=悬停移动
         返回 True 表示这是一个"裸 ESC"(未组成鼠标序列)。"""
@@ -1254,6 +1960,19 @@ class App:
         except (ValueError, IndexError):
             return False
         mx, my = x - 1, y - 1           # SGR 坐标从 1 起
+        if self.picking:
+            # 选择器有自己的点击/滚动语义, 不能落到主视图的 click()
+            if b in (64, 65):
+                self._pick_scroll(-3 if b == 64 else 3)
+                self.draw_picking(stdscr)
+            elif b == 0:
+                self.last_motion = time.time()
+                self._pick_click(my, mx, H)
+                if self.picking:
+                    self.draw_picking(stdscr)
+                else:
+                    self.draw(stdscr)   # 取消/选中后立即回到主视图
+            return False
         if b & 32 or b == 35:
             # 悬停移动(无按键)
             new_hover = None
@@ -1276,16 +1995,12 @@ class App:
                 self.draw(stdscr)
             return False
         if b in (64, 65):               # 滚轮
-            if b == 64:
-                self.offset = max(0, self.offset - 3)
-            else:
-                self.offset = min(max(0, len(items) - 1) if items else 0,
-                                  self.offset + 3)
+            self.scroll(-3 if b == 64 else 3, items, H)
             self.draw(stdscr)
             return False
         if b == 0:                      # 左键按下 → 点击
             self.last_motion = time.time()
-            self.click(my, mx, H, items, row_idx)
+            self.click(my, mx, H, items)
             self.draw(stdscr)
         return False
 
@@ -1313,33 +2028,38 @@ class App:
         self.proj_list = self.project_list(rows)
         n = len(self.proj_list) + 1      # 顶部多一个"输入新路径"入口
         self.psel = max(0, min(self.psel, n - 1))
+        view = max(1, H - 2)             # 列表可用的行
+        # 焦点始终保持可见
+        self.poff = max(0, min(self.poff, max(0, n - view)))
+        if self.psel < self.poff:
+            self.poff = self.psel
+        elif self.psel >= self.poff + view:
+            self.poff = self.psel - view + 1
         stdscr.erase()
+        self.row_at = {}
         band = curses.color_pair(12) | curses.A_BOLD
         stdscr.addnstr(0, 1, "NEW SESSION → 选择项目", W - 2, band)
         if W > 9:
             stdscr.addnstr(0, 9, " " * (W - 9), W - 9, band)
-        y = 1
-        sel0 = self.psel == 0
-        if sel0:
-            stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
-                           curses.color_pair(13))
-            stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
-        stdscr.addnstr(y, 2, "✎ 输入新路径…", W - 2,
-                       curses.color_pair(13 if sel0 else 26))
-        self.row_at[y] = -1              # -1 = 输入新路径入口
-        y += 1
-        for i, (cwd, name) in enumerate(self.proj_list):
-            if y > H - 2:
-                break
-            sel = self.psel == i + 1
+        if n > view:
+            d = f"{self.psel + 1}/{n}"
+            stdscr.addnstr(0, max(2, W - 1 - cell_len(d)), d, W - 2, band)
+        for pos in range(self.poff, min(n, self.poff + view)):
+            y = 1 + (pos - self.poff)
+            sel = pos == self.psel
             if sel:
                 stdscr.addnstr(y, 1, " " * (W - 2), W - 2,
                                curses.color_pair(13))
                 stdscr.addnstr(y, 1, "▌", 1, curses.color_pair(15))
-            stdscr.addnstr(y, 2, trunc(name, W - 4), W - 2,
-                           curses.color_pair(13 if sel else 1))
-            self.row_at[y] = i + 1
-            y += 1
+            if pos == 0:
+                stdscr.addnstr(y, 2, "✎ 输入新路径…", W - 2,
+                               curses.color_pair(13 if sel else 26))
+                self.row_at[y] = -1      # -1 = 输入新路径入口
+            else:
+                name = self.proj_list[pos - 1][1]
+                stdscr.addnstr(y, 2, trunc(name, W - 4), W - 2,
+                               curses.color_pair(13 if sel else 1))
+                self.row_at[y] = pos - 1
         self.cancel_zone = (1, cell_len("取消"))
         stdscr.addnstr(H - 1, 1, "取消", W - 2,
                        curses.color_pair(26 if self.hover == ("cancel",)
@@ -1348,12 +2068,40 @@ class App:
                        curses.color_pair(3))
         stdscr.refresh()
 
+    def _pick_click(self, my, mx, H):
+        """选择器里的点击: 取消 / 输入新路径 / 选中项目。"""
+        if time.time() < self.suppress_click_until:
+            return                      # 同一次点击的余波, 忽略
+        if my == H - 1:
+            if (self.cancel_zone
+                    and self.cancel_zone[0] <= mx <= self.cancel_zone[1] + 1):
+                self.picking = False   # 点击"取消" → 关闭选择器
+                self.suppress_click_until = time.time() + 0.4
+            return
+        if my not in self.row_at:
+            return
+        idx = self.row_at[my]
+        if idx == -1:
+            self.entry_mode = True
+            self.suppress_click_until = time.time() + 0.35
+        elif 0 <= idx < len(self.proj_list):
+            cwd = self.proj_list[idx][0]
+            self.picking = False
+            self.suppress_click_until = time.time() + 0.4
+            self.toast(self.new_session(cwd))
+
+    def _pick_scroll(self, delta):
+        n = len(self.proj_list) + 1
+        self.psel = max(0, min(self.psel + delta, n - 1))
+
     def tick_picking(self, stdscr):
         self.draw_picking(stdscr)
+        H = stdscr.getmaxyx()[0]
         ch = stdscr.getch()
         if ch == 27:
-            if self.handle_escape(stdscr, [], []):
+            if self.handle_escape(stdscr, []):
                 self.picking = False
+                self.suppress_click_until = time.time() + 0.4
                 self.draw(stdscr)
             return
         n = len(self.proj_list) + 1      # 含顶部"输入新路径"入口
@@ -1368,6 +2116,7 @@ class App:
             elif self.psel - 1 < len(self.proj_list):
                 cwd = self.proj_list[self.psel - 1][0]
                 self.picking = False
+                self.suppress_click_until = time.time() + 0.4
                 self.toast(self.new_session(cwd))
                 self.draw(stdscr)
             return
@@ -1376,19 +2125,15 @@ class App:
                 _, mx, my, _, bstate = curses.getmouse()
                 if bstate & (curses.BUTTON1_CLICKED
                              | curses.BUTTON1_PRESSED):
-                    if my == H - 1 and (self.cancel_zone and
-                                        self.cancel_zone[0] <= mx <=
-                                        self.cancel_zone[1] + 1):
-                        self.picking = False   # 点击"取消" → 关闭选择器
-                    elif my in self.row_at:
-                        idx = self.row_at[my]
-                        if idx == -1:
-                            self.entry_mode = True
-                        elif idx < len(self.proj_list):
-                            cwd = self.proj_list[idx][0]
-                            self.picking = False
-                            self.toast(self.new_session(cwd))
-                            self.draw(stdscr)
+                    self._pick_click(my, mx, H)
+                    if self.picking:
+                        self.draw_picking(stdscr)
+                    else:
+                        self.draw(stdscr)
+                elif bstate & curses.BUTTON4_PRESSED:
+                    self._pick_scroll(-3)
+                elif bstate & curses.BUTTON5_PRESSED:
+                    self._pick_scroll(3)
             except curses.error:
                 pass
 
@@ -1410,10 +2155,18 @@ class App:
         stdscr.addnstr(2, 3, shown, W - 3, curses.color_pair(26))
         stdscr.addnstr(2, 3 + cell_len(shown) + 1, "▌", 1,
                        curses.color_pair(5))
-        hint = "Enter 确认(目录不存在会自动创建) · Esc 取消"
-        stdscr.addnstr(H - 1, 1, trunc(hint, W - 2), W - 2,
+        # 底栏: 可点击的"取消" + 提示
+        stdscr.addnstr(H - 1, 1, "取消", W - 2,
+                       curses.color_pair(26 if self.hover == ("cancel",)
+                                         else 3))
+        stdscr.addnstr(H - 1, 6, "· Enter 确认(目录不存在会自动创建)", W - 5,
                        curses.color_pair(3))
         stdscr.refresh()
+
+    def _cancel_entry(self, stdscr):
+        self.entry_mode = False
+        self.suppress_click_until = time.time() + 0.4
+        self.draw_picking(stdscr)
 
     def tick_entry(self, stdscr):
         self.draw_entry(stdscr)
@@ -1421,14 +2174,49 @@ class App:
             ch = stdscr.get_wch()
         except curses.error:
             return          # get_wch 在 timeout 无输入时抛错, 跳过本拍
-        if ch == 27:
-            # 裸 ESC → 回到 picking; 鼠标序列在输入态忽略
+        H = stdscr.getmaxyx()[0]
+
+        # 鼠标: 只有点底栏"取消"才算取消, 其他位置忽略
+        if ch == curses.KEY_MOUSE:
+            if time.time() < self.suppress_click_until:
+                return
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if (bstate & (curses.BUTTON1_CLICKED
+                              | curses.BUTTON1_PRESSED)
+                        and my == H - 1 and mx <= cell_len("取消") + 1):
+                    self._cancel_entry(stdscr)
+            except curses.error:
+                pass
+            return
+
+        if ch in (27, "\x1b"):
+            # ESC 后面可能跟着 CSI(方向键/SGR 鼠标): 整段读掉再判断
             stdscr.timeout(40)
-            c2 = stdscr.getch()
+            first = stdscr.getch()
+            if first != 91:                 # 裸 ESC / Alt+键
+                stdscr.timeout(self.base_timeout)
+                if first == -1:             # 裸 ESC → 取消
+                    self._cancel_entry(stdscr)
+                return
+            seq = []
+            while len(seq) < 24:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                seq.append(c)
+                if 64 <= c <= 126:          # 终止字节
+                    break
             stdscr.timeout(self.base_timeout)
-            if c2 == -1:
-                self.entry_mode = False
-                self.draw_picking(stdscr)
+            if seq and seq[0] == 60:        # SGR: ESC [ < b ; x ; y M
+                try:
+                    parts = "".join(chr(c) for c in seq[1:-1]).split(";")
+                    b, x, y = int(parts[0]), int(parts[1]), int(parts[2])
+                except (ValueError, IndexError):
+                    return
+                if (b == 0 and y - 1 == H - 1
+                        and x - 1 <= cell_len("取消") + 1):
+                    self._cancel_entry(stdscr)
             return
         if ch in (curses.KEY_ENTER, 10, 13):
             path = os.path.expanduser(self.entry_buf.strip())
@@ -1441,48 +2229,67 @@ class App:
                     return
                 self.entry_mode = False
                 self.picking = False
+                self.suppress_click_until = time.time() + 0.4
                 self.toast(self.new_session(path))
                 self.draw(stdscr)
             else:
                 self.toast("需要绝对路径, 如 ~/code/new-project")
             return
-        if ch in (curses.KEY_BACKSPACE, 127, 8):
-            self.entry_buf = self.entry_buf[:-1]
-            self.draw_entry(stdscr)
+        # get_wch 对退格可能返回字符串 '\x7f'/'\x08', 也可能返回 int
+        if ch in (curses.KEY_BACKSPACE, curses.KEY_DC, 127, 8,
+                  "\x7f", "\x08"):
+            if self.entry_buf:
+                self.entry_buf = self.entry_buf[:-1]
+                self.draw_entry(stdscr)
         elif isinstance(ch, str) and ch.isprintable():
             self.entry_buf += ch
             self.draw_entry(stdscr)
 
     def new_session(self, cwd):
-        """在指定项目目录新建一个全新会话(右栏就地加载空白 claude)"""
+        """在指定项目目录新建会话(右栏加载空白 claude, 旧会话转入后台继续跑)"""
         pane = host_pane_id()
         if not pane:
             return "找不到宿主面板"
-        bin_dir = os.path.dirname(os.path.abspath(__file__))
-        r = tmux("respawn-pane", "-k", "-t", pane, "-c", cwd,
-                 "env", f"SHANNON_DIR={cwd}", "SHANNON_START=blank",
-                 f"{bin_dir}/shannon-host")
-        if r is not None and r.returncode == 0:
-            set_current_session("")
-            name = os.path.basename(cwd.rstrip("/")) or cwd
-            gid = f"ghost:{cwd}"
-            self.ghost = {
-                "id": gid,
-                "live_id": "",
-                "ids": [gid],
+        name = os.path.basename(cwd.rstrip("/")) or cwd
+        target = new_hidden_pane(
+            [f"SHANNON_DIR={cwd}", "SHANNON_START=blank"], cwd, name)
+        if not target:
+            return "创建失败"
+        now_ms = time.time() * 1000
+        with PanesStore() as entries:
+            entries.append({
+                "pane": target,
+                "ids": [],
                 "root": "",
                 "cwd": cwd,
-                "project": name,
-                "title": f"新会话 · {name}",
-                "mtime": time.time() * 1000,
-                "has_messages": True,
-                "starting": True,
-                "_group": cwd,
-                "_gname": name,
-            }
-            self.wake.set()          # 立即刷新, 新会话马上出现在列表里
-            return f"新会话已创建: {name}"
-        return "创建失败"
+                "name": name,
+                "last": time.time(),
+                "pending": True,      # transcript 落盘后由 bind_pending 认领
+                "after": now_ms - 5000,
+            })
+        if not swap_slot_in(target):
+            tmux("kill-pane", "-t", target)     # 换不进去就收掉, 不留孤儿面板
+            with PanesStore() as entries:
+                entries[:] = [e for e in entries if e["pane"] != target]
+            return "创建失败"
+        set_current_session("")
+        gid = f"ghost:{cwd}"
+        self.ghost = {
+            "id": gid,
+            "live_id": "",
+            "ids": [gid],
+            "root": "",
+            "cwd": cwd,
+            "project": name,
+            "title": f"新会话 · {name}",
+            "mtime": now_ms,
+            "has_messages": True,
+            "starting": True,
+            "_group": cwd,
+            "_gname": name,
+        }
+        self.wake.set()          # 立即刷新, 新会话马上出现在列表里
+        return f"新会话已创建: {name}"
 
     def tick(self, stdscr):
         try:
@@ -1508,7 +2315,6 @@ class App:
             return
         rows, live, ready, version = self.snapshot()
         items = self.display_items(rows)
-        row_idx = [i for i, it in enumerate(items) if it[0] == "row"]
         now = time.time()
         now_ms = now * 1000
         minute = int(now // 60)
@@ -1527,20 +2333,31 @@ class App:
             self.last_pane_check = now
             if (now - self.started_at > 10
                     and not self.right_pane_alive()):
-                log("宿主面板不存在, 侧栏退出")
+                log("宿主面板已关闭, 结束工作区")
+                tmux("kill-session", "-t", SESSION)
                 raise SystemExit(0)
-        # 布局守卫: 面板宽度偏离目标 → 立即重申 main-vertical 布局
-        self.layout_guard(stdscr)
+        # 布局守卫: 0.5s 一次足够; 每拍都查 tmux 只会白白卡 UI 线程
+        if now - self.last_guard >= 0.5:
+            self.last_guard = now
+            self.layout_guard(stdscr)
         # 悬停过期清理(鼠标离开侧栏后不再有 motion 事件)
-        if self.hover and now - self.last_motion > 2.0:
+        if self.hover and now - self.last_motion > 5.0:
             self.hover = None
+            self.draw(stdscr)
+        # toast 到期后恢复底栏按钮
+        if self.msg and now >= self.msg_until:
+            self.msg = ""
+            self.draw(stdscr)
+        # 键盘高亮 5 秒后自动消失
+        if self.focus_visible and now - self.focus_ts > 5.0:
+            self.focus_visible = False
             self.draw(stdscr)
 
         ch = stdscr.getch()
         if ch == 27:
             # SGR 鼠标序列(悬停/点击/滚轮)由我们自己解码 — 对齐 fleet view;
             # 裸 ESC = 取消 picking
-            plain = self.handle_escape(stdscr, items, row_idx)
+            plain = self.handle_escape(stdscr, items)
             if plain and self.picking:
                 self.picking = False
                 self.draw(stdscr)
@@ -1552,16 +2369,22 @@ class App:
             self.act(lambda: subprocess.run([TOGGLE]))   # rail 任意键 → 展开
             self.draw(stdscr)
         elif ch in (curses.KEY_DOWN, ord("j")):
-            self.move(row_idx, 1)
+            self.move(items, 1)
             self.draw(stdscr)
         elif ch in (curses.KEY_UP, ord("k")):
-            self.move(row_idx, -1)
+            self.move(items, -1)
+            self.draw(stdscr)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if (items and 0 <= self.sel < len(items)
+                    and items[self.sel][0] == "row"):
+                self.focus_visible = False      # 打开会话后撤掉灰底
+            self.open_selected(items)
             self.draw(stdscr)
         elif ch in (ord("x"), curses.KEY_DC):
             # 隐藏焦点会话(数据不动, 只是不再显示)
-            if row_idx and self.sel < len(row_idx):
-                row = items[row_idx[self.sel]][1]
-                if not row["id"].startswith("ghost:"):
+            if items and 0 <= self.sel < len(items):
+                kind, row = items[self.sel]
+                if kind == "row" and not row["id"].startswith("ghost:"):
                     # 隐藏整个会话族(而不只是当前分段), 否则 fork 会重新冒出来
                     ids = list(row.get("ids") or [row["id"]])
                     if row.get("root"):
@@ -1577,14 +2400,13 @@ class App:
                 if bstate & (curses.BUTTON1_CLICKED
                              | curses.BUTTON1_PRESSED):
                     self.last_motion = time.time()
-                    self.click(my, mx, H, items, row_idx)
+                    self.click(my, mx, H, items)
                     self.draw(stdscr)
                 elif bstate & curses.BUTTON4_PRESSED:
-                    self.offset = max(0, self.offset - 3)
+                    self.scroll(-3, items, H)
                     self.draw(stdscr)
                 elif bstate & curses.BUTTON5_PRESSED:
-                    self.offset = min(max(0, len(items) - 1),
-                                      self.offset + 3)
+                    self.scroll(3, items, H)
                     self.draw(stdscr)
                 elif bstate & curses.REPORT_MOUSE_POSITION:
                     # 鼠标悬停: 命中行/按钮变化时重画

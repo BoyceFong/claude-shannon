@@ -7,12 +7,23 @@
 # mode=manual(用户手动折叠)时, 拓宽窗口也不会自动展开。
 
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
-STATE_DIR="$HOME/.claude/shannon"
 SESS="${SHANNON_SESSION:-shannon}"
-. "$STATE_DIR/config" 2>/dev/null || true
-SIDEBAR_W=${SIDEBAR_W:-35}
-RAIL_W=${RAIL_W:-2}
-COLLAPSE_AT=${COLLAPSE_AT:-70}
+# 与 shannon-workspace 保持同一套状态目录规则
+if [ "$SESS" = "shannon" ]; then
+  STATE_DIR="$HOME/.claude/shannon"
+else
+  SAFE_SESS=$(printf '%s' "$SESS" | tr -c 'A-Za-z0-9_-' '_')
+  STATE_DIR="$HOME/.claude/shannon/sessions/$SAFE_SESS"
+fi
+# config 用逐行解析而不是 source: 状态文件里即使混进 shell 代码也不会被执行
+cfg() { # cfg KEY DEFAULT
+  v=$(awk -F= -v k="$1" '$1==k && $2 ~ /^[0-9]+$/ {v=$2} END {print v}' \
+      "$STATE_DIR/config" 2>/dev/null)
+  printf '%s\n' "${v:-$2}"
+}
+SIDEBAR_W=$(cfg SIDEBAR_W 35)
+RAIL_W=$(cfg RAIL_W 2)
+COLLAPSE_AT=$(cfg COLLAPSE_AT 70)
 
 # 展开宽度 = 用户记忆值, 限制在 [12, 35]
 EXPAND_W=$(cat "$STATE_DIR/sidebar-w" 2>/dev/null || true)
@@ -23,6 +34,11 @@ case "$EXPAND_W" in ''|*[!0-9]*) EXPAND_W=$SIDEBAR_W ;; esac
 HOST_PANE=$(cat "$STATE_DIR/host-pane" 2>/dev/null)
 [ -n "$HOST_PANE" ] || exit 0
 SB=$(cat "$STATE_DIR/sidebar-pane" 2>/dev/null)
+# 记录可能指向已经死掉的面板: 只有 tmux 里真实存在才算数
+if [ -n "$SB" ]; then
+  tmux list-panes -s -t "$SESS" -F '#{pane_id}' 2>/dev/null \
+    | grep -qx "$SB" || SB=
+fi
 MODE=$(cat "$STATE_DIR/mode" 2>/dev/null)
 
 # 窗口宽度(attached 时等于 client 宽度; detached 也可用, 便于测试)
@@ -44,8 +60,12 @@ apply() { # $1 = 目标宽度, $2 = mode
 # 侧栏面板不存在: 宽度足够且非手动折叠 → 重新切出
 if [ -z "$SB" ]; then
   if [ "$W" -ge "$COLLAPSE_AT" ] && [ "$MODE" != "manual" ]; then
-    tmux split-window -h -b -l "$EXPAND_W" -t "$HOST_PANE" \
-      -c "$HOME" "$BIN_DIR/shannon-sidebar" && echo auto > "$STATE_DIR/mode"
+    NEW_SB=$(tmux split-window -h -b -l "$EXPAND_W" -t "$HOST_PANE" \
+      -P -F '#{pane_id}' -c "$HOME" "$BIN_DIR/shannon-sidebar" 2>/dev/null)
+    if [ -n "$NEW_SB" ]; then
+      printf '%s\n' "$NEW_SB" > "$STATE_DIR/sidebar-pane"   # 否则 toggle 指向死面板
+      echo auto > "$STATE_DIR/mode"
+    fi
   fi
   exit 0
 fi
