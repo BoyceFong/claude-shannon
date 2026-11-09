@@ -6,11 +6,11 @@ A tmux workspace that turns [Claude Code](https://docs.anthropic.com/en/docs/cla
 
 ![claude-shannon workspace](docs/images/ui.png)
 
-*Left: every conversation across all your projects, grouped by workspace, with live status dots. Right: Claude Code — the fleet view by default, or any conversation you click, loaded in place.*
+*Left: every session the fleet view knows about, grouped by project path, with live status dots. Right: Claude Code — the fleet view by default, or any conversation you click, loaded in place.*
 
-Collapsed state — the sidebar shrinks to a slim rail; one click on `▶` brings it back:
+The right pane is unmodified Claude Code. A running turn keeps running while you look elsewhere, and the sidebar follows whatever is actually on screen:
 
-![claude-shannon collapsed](docs/images/ui-collapsed.png)
+![claude-shannon right pane](docs/images/ui-right-pane.png)
 
 ## Why
 
